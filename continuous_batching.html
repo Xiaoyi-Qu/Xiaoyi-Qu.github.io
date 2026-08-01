@@ -1,0 +1,326 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+<link rel="shortcut icon" href="myIcon.ico">
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+<meta name="keywords" content="Continuous Batching, LLM Inference, 连续批处理">
+<meta name="description" content="Continuous Batching for LLM Inference">
+<link rel="stylesheet" href="jemdoc.css" type="text/css">
+<title>Continuous Batching — 连续批处理</title>
+<style>
+/* ── Extra styles scoped to this article ── */
+pre.codeblock {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 12px 0 18px;
+}
+.callout {
+    border-left: 3px solid #2563EB;
+    background: #EFF6FF;
+    padding: 10px 14px;
+    margin: 14px 0;
+    font-size: 14px;
+}
+.callout.warn {
+    border-left-color: #F59E0B;
+    background: #FFFBEB;
+}
+.callout.negative {
+    border-left-color: #EF4444;
+    background: #FEF2F2;
+}
+table.comparison {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 14px 0 18px;
+    font-size: 14px;
+}
+table.comparison th {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+}
+table.comparison td {
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+}
+.formula-box {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 14px 20px;
+    border-radius: 6px;
+    margin: 12px 0 18px;
+    line-height: 1.8;
+}
+.back-link {
+    font-size: 13px;
+    margin-bottom: 20px;
+    display: block;
+}
+</style>
+</head>
+<body>
+
+<div id="layout-content" style="margin-top:25px">
+
+<a class="back-link" href="index.html">&larr; Back to homepage</a>
+
+<div id="toptitle">
+<h1>7.1 Continuous Batching（连续批处理）</h1>
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在大语言模型（LLM）推理服务中，如何高效地将多个请求组织在一起进行批量推理，是决定系统吞吐量与延迟的核心问题。传统的静态批处理方式存在严重的资源浪费，而连续批处理（Continuous Batching）通过在每一次迭代（iteration）粒度上动态调度请求，从根本上解决了这一瓶颈。本节将从静态批处理的缺陷出发，逐步推导出连续批处理的设计思路，并深入分析其关键参数与代码实现。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.1.1 静态批处理的问题</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>什么是静态批处理</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+静态批处理（Static Batching）是最朴素的批量推理策略：推理引擎收集若干请求，将它们组成一个固定的批次（batch），然后让这个批次中的所有请求从头到尾一起执行，直到批次内<b>所有</b>请求都生成完毕后，才将结果统一返回，并开始接收下一个批次。
+</p>
+
+<pre class="codeblock">
+时间轴 →
+
+Batch 1: [Req A, Req B, Req C]  全部完成 → 返回结果
+                                              ↓
+Batch 2: [Req D, Req E]         全部完成 → 返回结果
+</pre>
+
+<h3>核心问题：长短不齐导致的 GPU 空转</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+LLM 的自回归生成有一个关键特点——不同请求的输出长度差异极大。一个简单的问答可能只需要生成 10 个 token，而一篇摘要可能需要 500 个 token。在静态批处理中，短请求生成完毕后，必须<b>等待</b>同批次中最长的请求结束，GPU 在这段等待时间内要么完全空转，要么在对已完成请求做无意义的 padding 计算。
+</p>
+
+<pre class="codeblock">
+假设 Batch 中有 4 个请求，生成长度分别为：
+
+  Req A:  20 tokens   ████░░░░░░░░░░░░░░░░░░░░░░  (step 1-20)
+  Req B:  50 tokens   ████████████░░░░░░░░░░░░░░  (step 1-50)
+  Req C: 100 tokens   ██████████████████████████  (step 1-100)
+  Req D:  10 tokens   ██░░░░░░░░░░░░░░░░░░░░░░░░  (step 1-10)
+
+  ░ = GPU 空转 / padding 计算
+
+整个 Batch 必须运行 100 步才能结束。
+GPU 有效利用率 = (20+50+100+10) / (4×100) = 180/400 = 45%
+</pre>
+
+<div class="callout negative">
+<b>55% 的算力被完全浪费了。</b> 在生产环境中，输出长度的方差往往更大，这一浪费比例可能达到 70% 以上。
+</div>
+
+<h3>延迟的放大效应</h3>
+
+<p>考虑一个实际场景：</p>
+<ul>
+<li><p>新请求 Req E 在 Batch 1 执行到第 5 步时到达</p></li>
+<li><p>Req E 本身只需要生成 8 个 token</p></li>
+<li><p>但它必须等到 Batch 1 全部完成（假设还需 95 步），才能被编入 Batch 2</p></li>
+<li><p>加上自身的 8 步生成时间，Req E 的总延迟 = 95 + 8 = 103 步</p></li>
+</ul>
+
+<div class="callout warn">
+<b>请求的等待时间可能远大于其实际计算时间</b>，这对用户体验是不可接受的。
+</div>
+
+<h3>小结</h3>
+
+<p>静态批处理的两个根本缺陷：</p>
+<ol>
+<li><p><b>资源浪费</b>：短请求被迫等待长请求，GPU 空转或做 padding 计算，有效利用率低。</p></li>
+<li><p><b>延迟膨胀</b>：新请求无法插入正在执行的批次，必须等当前批次整体完成，排队延迟不可控。</p></li>
+</ol>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这两个问题的根源在于同一个设计决策：<b>批次的生命周期与批次内最长请求绑定</b>。要打破这一限制，就需要将调度粒度从"批次级"下沉到"迭代级"。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.1.2 迭代级批处理与队头阻塞的消除</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>从批次级到迭代级</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+连续批处理的核心思想来自 2022 年由 Orca 论文（Yu et al.）提出的<b>迭代级调度（Iteration-Level Scheduling）</b>：不再以整个批次的生命周期为调度单位，而是在<b>每一步解码迭代</b>（即每生成一个 token）结束时重新审视批次的组成。
+</p>
+
+<p>其核心规则极其简洁：</p>
+<ul>
+<li><p><b>规则一</b>：每一步迭代结束后，检查是否有请求已生成 EOS（结束标记）或达到最大长度。如果有，<b>立即将其移出批次</b>，释放其占用的资源。</p></li>
+<li><p><b>规则二</b>：每一步迭代结束后，检查等待队列中是否有新请求。如果有且资源允许，<b>立即将其加入批次</b>，参与下一步迭代。</p></li>
+</ul>
+
+<pre class="codeblock">
+时间轴 →   step1  step2  step3  step4  step5  step6  step7  step8 ...
+
+  Req A:    ██     ██     ██     Done
+  Req B:    ██     ██     ██     ██     ██     Done
+  Req C:    ██     ██     ██     ██     ██     ██     ██     ██ ...
+  Req D:                         ██     ██     Done           ← step4 加入
+  Req E:                                       ██     ██ ... ← step6 加入
+
+批次大小动态变化：3 → 3 → 3 → 3 → 3 → 3 → 2 → 2 ...
+</pre>
+
+<p>与静态批处理相比，关键变化在于：</p>
+<ul>
+<li><p>Req A 在 step3 完成后立刻释放 slot，不再空转</p></li>
+<li><p>Req D 不必等待 Req C 完成，在 step4 就加入批次开始处理</p></li>
+<li><p>GPU 在每个 step 都满载运行，没有 padding 浪费</p></li>
+</ul>
+
+<h3>队头阻塞（Head-of-Line Blocking）的消除</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+"队头阻塞"是网络领域的经典概念——队列最前面的元素处理缓慢时，会阻塞后面所有元素的处理。静态批处理天然具有这种队头阻塞特性：一个超长请求会拖慢同批次内所有其他请求的返回。连续批处理通过迭代级调度，彻底消除了队头阻塞：
+</p>
+
+<table class="comparison">
+<tr><th>维度</th><th>静态批处理</th><th>连续批处理</th></tr>
+<tr><td>短请求延迟</td><td>受同批次最长请求影响</td><td>生成完毕立刻返回</td></tr>
+<tr><td>新请求等待</td><td>必须等当前批次结束</td><td>下一步迭代即可加入</td></tr>
+<tr><td>GPU 利用率</td><td>随长短差异增大而下降</td><td>始终接近满载</td></tr>
+<tr><td>队头阻塞</td><td>严重</td><td>不存在</td></tr>
+</table>
+
+<h3>Prefill 与 Decode 的混合调度</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+连续批处理还引入了一个重要的设计考量：当新请求加入批次时，它需要先经历 <b>Prefill 阶段</b>（处理整个输入 prompt），而批次中已有的请求正处于 <b>Decode 阶段</b>（每步只生成一个 token）。这两种操作的计算特性截然不同：
+</p>
+
+<ul>
+<li><p><b>Prefill</b>：计算密集（Compute-Bound），需要一次性处理大量 token，受算力瓶颈限制</p></li>
+<li><p><b>Decode</b>：访存密集（Memory-Bound），每步只处理一个 token，受显存带宽瓶颈限制</p></li>
+</ul>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在连续批处理框架下，Prefill 和 Decode 可以在同一个 batch step 内混合执行。调度器需要在两者之间做权衡：如果让过多新请求同时进行 Prefill，单步延迟会被拉高，影响正在 Decode 的请求的 TPOT（Time Per Output Token）；如果过度限制 Prefill，新请求的 TTFT（Time To First Token）会增大。
+</p>
+
+<div class="callout">
+现代推理引擎（如 vLLM）通过 <tt>max_num_batched_tokens</tt> 等参数来控制单步内 Prefill 的 token 总量，从而在 TTFT 和 TPOT 之间寻找平衡。
+</div>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.1.3 max_num_seqs 与 max_num_batched_tokens 的相反影响</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+连续批处理的调度器有两个核心控制旋钮，它们从不同维度约束了批次的规模，且对系统性能的影响方向恰好相反。理解这两个参数的交互关系，是调优推理服务性能的关键。
+</p>
+
+<h3>max_num_seqs：序列数上限</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<tt>max_num_seqs</tt>（在某些框架中也叫 <tt>max_batch_size</tt>）定义了<b>同时存在于批次中的请求（序列）数量上限</b>。
+</p>
+
+<pre class="codeblock">
+max_num_seqs = 4 时：
+
+  Batch 最多同时包含 4 个序列
+  ┌──────────────────────┐
+  │ Seq 0 (decode)       │
+  │ Seq 1 (decode)       │
+  │ Seq 2 (prefill)      │
+  │ Seq 3 (decode)       │
+  └──────────────────────┘
+  第 5 个请求必须在队列中等待
+</pre>
+
+<p><b>增大 <tt>max_num_seqs</tt> 的影响</b>：</p>
+<ul>
+<li><p>吞吐量提高：更多请求并行处理，GPU 的计算单元被更充分地利用</p></li>
+<li><p>显存压力增大：每个序列都需要维护独立的 KV Cache，序列数越多，KV Cache 占用的显存越大</p></li>
+<li><p>单步延迟略增：更大的 batch 意味着每步 matmul 的计算量更大</p></li>
+</ul>
+
+<h3>max_num_batched_tokens：单步 Token 总量上限</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<tt>max_num_batched_tokens</tt> 定义了<b>单步迭代中参与计算的 token 总数上限</b>。这个数字是所有序列在当前步的 token 数之和：处于 Decode 阶段的序列贡献 1 个 token，处于 Prefill 阶段的序列贡献其 prompt 长度个 token。
+</p>
+
+<pre class="codeblock">
+max_num_batched_tokens = 2048 时：
+
+  假设当前批次有 3 个 decode 序列 (各贡献 1 token)
+  token 预算剩余 = 2048 - 3 = 2045
+  → 可以再接入一个 prompt 长度 ≤ 2045 的新请求做 Prefill
+  → 或接入多个短 prompt 的新请求
+</pre>
+
+<h3>相反影响的本质</h3>
+
+<table class="comparison">
+<tr><th>参数</th><th>增大时对吞吐的影响</th><th>增大时对延迟的影响</th><th>瓶颈维度</th></tr>
+<tr><td><tt>max_num_seqs</tt></td><td>↑ 提高</td><td>TPOT 略增</td><td>显存容量（KV Cache）</td></tr>
+<tr><td><tt>max_num_batched_tokens</tt></td><td>↑ 提高（Prefill）</td><td>TPOT 显著恶化</td><td>计算量 / 单步耗时</td></tr>
+</table>
+
+<p>它们的"相反影响"体现在实际调优中的权衡：</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>场景一：长对话、短输出（如客服机器人）</b> — Prompt 长、输出短，Prefill 是瓶颈。应适当增大 <tt>max_num_batched_tokens</tt> 以提高 Prefill 吞吐，<tt>max_num_seqs</tt> 可以适中，因为序列存活时间短。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>场景二：短输入、长输出（如代码生成）</b> — Prefill 很快，Decode 阶段长。应增大 <tt>max_num_seqs</tt> 以并行处理更多序列，<tt>max_num_batched_tokens</tt> 保持适中，避免拖慢 Decode 的 TPOT。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>场景三：严格延迟要求（如实时交互）</b> — 两个参数都不宜过大，需要通过压力测试找到 TPOT ≤ 目标值时的最大 batch 规模。
+</p>
+
+<h3>参数间的隐式联动</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+需要特别注意的是，这两个参数并非独立生效，而是存在隐式的联动关系：
+</p>
+
+<div class="formula-box">
+实际单步 token 数 = min(<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;max_num_batched_tokens,<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;sum(各序列当前步的 token 数) &nbsp;← 受 max_num_seqs 间接约束<br/>
+)
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+当 <tt>max_num_seqs</tt> 很小时，即使 <tt>max_num_batched_tokens</tt> 设得很大，实际的 token 总量也不会太高（除非某个 prompt 极长）。反之，当 <tt>max_num_seqs</tt> 很大且都在 Decode 阶段时，每步 token 总量 ≈ <tt>max_num_seqs</tt>（每个序列贡献 1 token），此时 <tt>max_num_batched_tokens</tt> 几乎不起约束作用。
+</p>
+
+<div class="callout">
+<b>真正的调优需要将两个参数结合目标硬件的显存容量和计算能力一起考虑</b>，而不是孤立地调整某一个。
+</div>
+
+</div>
+
+<div id="footer">
+<div id="footer-text"></div>
+</div>
+
+<p><center>
+&copy; Xiaoyi | <a href="index.html">Homepage</a>
+</center></p>
+
+</body>
+</html>

@@ -1,0 +1,655 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+<link rel="shortcut icon" href="myIcon.ico">
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+<meta name="keywords" content="Inference Scheduling, LLM Serving, 推理调度, vLLM, KV Cache">
+<meta name="description" content="Inference Scheduling for LLM Serving">
+<link rel="stylesheet" href="jemdoc.css" type="text/css">
+<title>Inference Scheduling — 推理调度</title>
+<style>
+/* ── Extra styles scoped to this article ── */
+pre.codeblock {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 12px 0 18px;
+}
+.callout {
+    border-left: 3px solid #2563EB;
+    background: #EFF6FF;
+    padding: 10px 14px;
+    margin: 14px 0;
+    font-size: 14px;
+}
+.callout.warn {
+    border-left-color: #F59E0B;
+    background: #FFFBEB;
+}
+.callout.negative {
+    border-left-color: #EF4444;
+    background: #FEF2F2;
+}
+table.comparison {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 14px 0 18px;
+    font-size: 14px;
+}
+table.comparison th {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+}
+table.comparison td {
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+}
+.formula-box {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 14px 20px;
+    border-radius: 6px;
+    margin: 12px 0 18px;
+    line-height: 1.8;
+}
+.back-link {
+    font-size: 13px;
+    margin-bottom: 20px;
+    display: block;
+}
+</style>
+</head>
+<body>
+
+<div id="layout-content" style="margin-top:25px">
+
+<a class="back-link" href="index.html">&larr; Back to homepage</a>
+
+<div id="toptitle">
+<h1>7.2 推理调度</h1>
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+推理调度是 LLM Serving 系统的"大脑"——它决定了在每一个 decode iteration 中，哪些请求可以进入 batch、哪些必须等待、哪些需要被暂时驱逐。调度策略直接影响吞吐量、延迟、公平性三者的平衡。本节从最基础的请求级调度策略出发，逐步深入到抢占机制设计、vLLM V1 的架构决策，以及面向生产环境的高级调度策略。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.2.1 请求级调度：FCFS / SJF / 优先级与饥饿问题</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>问题定义</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+LLM 推理请求与传统 Web 请求有本质区别：一个请求不是"一次性完成"的，而是需要持续多个 decode step，每个 step 产生一个 token。在整个生成过程中，请求持续占用 GPU 上的 KV Cache 资源。这意味着调度器面临一个<b>持续资源分配问题</b>，而非简单的排队问题。
+</p>
+
+<p>调度器需要回答两个核心问题：</p>
+<ol>
+<li><p><b>准入控制（Admission Control）</b>：等待队列中的哪些请求可以进入当前的 running batch？</p></li>
+<li><p><b>驱逐选择（Eviction Selection）</b>：当 GPU 内存不足时，正在运行的哪些请求应该被暂停？</p></li>
+</ol>
+
+<h3>三种基础策略</h3>
+
+<p><b>FCFS（First Come First Served，先来先服务）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+FCFS 是最朴素的调度策略：按请求到达时间排序，先到的请求优先获得 GPU 资源。
+</p>
+
+<pre class="codeblock">
+等待队列: [R1(t=0), R2(t=1), R3(t=2), R4(t=3)]
+                ↓ FCFS 准入
+Running Batch: [R1, R2, R3]  ← 按到达顺序依次准入
+Waiting:       [R4]          ← GPU 内存不足，排队等待
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+优点是实现简单、公平性好（不存在饥饿问题），缺点是完全不考虑请求的资源特征。一个预计生成 2048 token 的长请求会长时间占用 KV Cache，阻塞后续大量短请求。这就是经典的 <b>Head-of-Line Blocking（队头阻塞）</b> 问题。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+vLLM（V0 和 V1）的默认策略就是 FCFS。在大多数场景下，FCFS 配合 continuous batching 已经能提供不错的性能，因为 continuous batching 本身就允许已完成的请求随时退出 batch，为新请求腾出空间。
+</p>
+
+<p><b>SJF（Shortest Job First，最短作业优先）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+SJF 优先调度预计生成长度最短的请求，以最小化平均请求延迟（平均周转时间）。
+</p>
+
+<pre class="codeblock">
+等待队列: [R1(预估500tok), R2(预估50tok), R3(预估200tok)]
+                ↓ SJF 排序
+调度顺序: [R2(50tok), R3(200tok), R1(500tok)]
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+SJF 在理论上是最优的平均延迟策略（可证明），但在 LLM 场景下面临两个实际困难：
+</p>
+
+<ol>
+<li><p><b>生成长度不可预知</b>：auto-regressive 生成的长度取决于输入内容和采样策略，在请求开始前无法精确得知。虽然可以通过历史统计或专门的长度预测模型来估算，但预测误差会显著影响调度效果。</p></li>
+<li><p><b>饥饿风险</b>：如果短请求持续到达，长请求可能被无限推迟。在生产系统中，这意味着某些用户的请求可能永远得不到响应。</p></li>
+</ol>
+
+<p><b>优先级调度（Priority Scheduling）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+优先级调度为每个请求分配一个优先级，高优先级的请求先被调度。优先级可以基于多种因素：
+</p>
+
+<ul>
+<li><p>用户等级（付费用户 &gt; 免费用户）</p></li>
+<li><p>请求类型（交互式对话 &gt; 批量处理）</p></li>
+<li><p>SLA 要求（有延迟 SLA 的请求优先级更高）</p></li>
+<li><p>业务逻辑（关键业务路径上的请求优先）</p></li>
+</ul>
+
+<pre class="codeblock">
+等待队列: [R1(P=低,批量), R2(P=高,实时), R3(P=中,普通)]
+                ↓ 优先级排序
+调度顺序: [R2(高), R3(中), R1(低)]
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+优先级调度的主要风险同样是 <b>饥饿（Starvation）</b>：低优先级请求可能长时间得不到服务。
+</p>
+
+<h3>饥饿问题与缓解策略</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+饥饿是 SJF 和优先级调度的共同隐患。常见的缓解手段包括：
+</p>
+
+<p><b>老化（Aging）</b>：随着请求在队列中等待的时间增长，逐步提升其优先级。这保证了每个请求最终都能得到服务。</p>
+
+<div class="formula-box">
+effective_priority = base_priority + α * waiting_time
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+其中 α 是老化系数，控制等待时间对优先级的影响力度。α 越大，越倾向于公平性（接近 FCFS）；α 越小，越倾向于效率（接近纯优先级调度）。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>多级反馈队列（MLFQ）</b>：借鉴操作系统的思想，将请求分配到多个优先级队列中。新请求进入最高优先级队列，如果在时间片内未完成则降级到下一队列。这样短请求天然获得高优先级，长请求逐步降级但不会被永远忽略。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>混合策略</b>：在实践中，很多系统采用"优先级 + FCFS"的混合策略——同一优先级内部按 FCFS 排序，不同优先级之间按优先级调度。结合 aging 机制，这在公平性和效率之间取得了实用的平衡。
+</p>
+
+<h3>调度粒度：请求级 vs. Token 级</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+值得注意的是，上述策略都属于 <b>请求级调度</b>——调度的单位是整个请求。在 continuous batching 框架下，调度器在每个 iteration 开始时决定 running batch 的组成，但 batch 内的所有请求在该 iteration 中享有同等的计算权利（各生成一个 token）。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+更细粒度的 <b>token 级调度</b> 理论上是可能的（比如为高优先级请求分配更多的 decode step），但这会打破 batching 的效率优势，在实践中较少采用。Sarathi-Serve 等系统探索了 chunk 级调度——将 prefill 阶段分成多个 chunk，与 decode 交错执行——这可以看作是介于请求级和 token 级之间的一种折中。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.2.2 抢占：换出（Swap）与重算（Recompute）的取舍</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>为什么需要抢占</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在 continuous batching 系统中，所有正在运行的请求共享 GPU 上有限的 KV Cache 空间。由于生成长度不可预知，可能出现以下场景：
+</p>
+
+<pre class="codeblock">
+时刻 T:  Running Batch = [R1, R2, R3, R4]
+         GPU KV Cache 使用率 = 95%
+         R1-R4 均在生成中，各自的 KV Cache 持续增长
+
+时刻 T+1: R1-R4 各新增 1 个 token 的 KV Cache
+          GPU KV Cache 使用率 → 超过 100%！
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+此时系统必须做出抢占决策：暂停某些请求的执行，释放其 KV Cache 空间，以保证其余请求和新到达的高优先级请求能够继续运行。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+被抢占的请求需要在后续被恢复执行。恢复时的核心问题是：<b>如何重新获取该请求已经生成的 KV Cache？</b> 这正是换出和重算两种策略的分歧点。
+</p>
+
+<h3>策略一：换出（Swap）</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+换出策略将被抢占请求的 KV Cache 从 GPU 显存复制到 CPU 内存（或 SSD），在恢复时再复制回来。
+</p>
+
+<pre class="codeblock">
+抢占时:
+  GPU Memory: [R1_KV, R2_KV, R3_KV, R4_KV]
+                        ↓ 换出 R4
+  GPU Memory: [R1_KV, R2_KV, R3_KV, ________]
+  CPU Memory: [..., R4_KV]
+
+恢复时:
+  CPU Memory: [R4_KV] → 复制回 GPU
+  GPU Memory: [R1_KV, R4_KV, ________]  (R2/R3 已完成退出)
+</pre>
+
+<p><b>优点</b>：</p>
+<ul>
+<li><p><b>零冗余计算</b>：恢复时无需重新执行 prefill 和之前的 decode step，KV Cache 完整保留。</p></li>
+<li><p><b>恢复延迟确定性高</b>：恢复时间主要取决于数据传输量，相对可预测。</p></li>
+</ul>
+
+<p><b>缺点</b>：</p>
+<ul>
+<li><p><b>CPU 内存消耗大</b>：需要在 CPU 侧预留大量内存来存储换出的 KV Cache。对于大模型（如 70B 参数），单个请求的 KV Cache 可能达到数百 MB 甚至 GB 级别。</p></li>
+<li><p><b>传输带宽是瓶颈</b>：PCIe 带宽（Gen4 x16 约 32 GB/s，Gen5 x16 约 64 GB/s）有限，大量 KV Cache 的 swap-in/swap-out 会阻塞 GPU 计算流水线。如果 swap 操作不能与计算完全重叠（overlap），就会引入显著的气泡（bubble）。</p></li>
+<li><p><b>实现复杂度高</b>：需要管理 GPU-CPU 之间的异步数据传输、内存生命周期、传输失败的回退逻辑等。</p></li>
+<li><p><b>与分页机制的交互</b>：在 PagedAttention 架构下，KV Cache 是以 block 为单位分页管理的。换出需要以 block 粒度进行，涉及页表映射的更新。</p></li>
+</ul>
+
+<div class="callout">
+<b>Swap 适用场景</b>：请求已经生成了大量 token（KV Cache 很大），重算代价极高；同时系统有充足的 PCIe 带宽和 CPU 内存。
+</div>
+
+<h3>策略二：重算（Recompute / Recomputation）</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+重算策略在抢占时直接 <b>丢弃</b> 被抢占请求的 KV Cache，仅保留其输入 prompt 和已生成的 token 序列（文本形式）。恢复时，将完整的 token 序列（prompt + 已生成 tokens）重新跑一次 prefill，重建 KV Cache。
+</p>
+
+<pre class="codeblock">
+抢占时:
+  GPU Memory: [R1_KV, R2_KV, R3_KV, R4_KV]
+                        ↓ 丢弃 R4_KV
+  GPU Memory: [R1_KV, R2_KV, R3_KV, ________]
+  保留: R4 的 token 序列 [t1, t2, ..., tn]  (仅文本，几乎不占空间)
+
+恢复时:
+  将 [prompt + t1...tn] 作为新的 prefill 请求重新执行
+  GPU 重新计算完整的 KV Cache
+</pre>
+
+<p><b>优点</b>：</p>
+<ul>
+<li><p><b>零额外内存</b>：不需要 CPU 侧的 KV Cache 存储空间。</p></li>
+<li><p><b>无传输开销</b>：不涉及 GPU↔CPU 的数据搬运，不占用 PCIe 带宽。</p></li>
+<li><p><b>实现简洁</b>：只需保存 token 序列，恢复时作为普通 prefill 请求重新提交。</p></li>
+<li><p><b>与 prefill 优化天然兼容</b>：重算本质上就是一次 prefill，可以利用所有 prefill 优化技术（chunked prefill、prefix caching 等）。</p></li>
+</ul>
+
+<p><b>缺点</b>：</p>
+<ul>
+<li><p><b>冗余计算</b>：需要重新计算已经算过的 KV Cache，消耗 GPU 算力。如果请求已经生成了很多 token，重算的 FLOPs 开销可观。</p></li>
+<li><p><b>恢复延迟不确定</b>：重算时间取决于序列总长度，长请求的恢复可能需要较长时间。</p></li>
+</ul>
+
+<div class="callout">
+<b>Recompute 适用场景</b>：请求处于早期阶段（已生成的 token 不多），重算成本低；或者系统 GPU 算力充裕但 CPU 内存 / PCIe 带宽紧张。
+</div>
+
+<h3>量化对比</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+下面用一个简化的数值例子说明两种策略的成本差异。假设模型为 LLaMA-13B，被抢占请求已生成 512 个 token：
+</p>
+
+<table class="comparison">
+<tr><th>维度</th><th>Swap</th><th>Recompute</th></tr>
+<tr><td>KV Cache 大小（估算）</td><td>~400 MB（取决于层数、head 数、精度）</td><td>0（直接丢弃）</td></tr>
+<tr><td>传输时间（PCIe Gen4）</td><td>~12.5 ms（400MB / 32GB/s）</td><td>0</td></tr>
+<tr><td>重算时间</td><td>0</td><td>~15-30 ms（512 tokens 的 prefill）</td></tr>
+<tr><td>CPU 内存占用</td><td>400 MB</td><td>~2 KB（仅 token IDs）</td></tr>
+<tr><td>实现复杂度</td><td>高（异步传输管理）</td><td>低（重新提交即可）</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在这个例子中，两种策略的恢复延迟处于同一量级，但 recompute 在内存和实现复杂度上有显著优势。当序列更长（如 4096 tokens）时，recompute 的计算成本会上升，但由于 prefill 阶段是 compute-bound 且可以高效利用 GPU 并行性，实际耗时增长通常是亚线性的。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.2.3 vLLM V1 统一改用重算的原因</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>背景：vLLM V0 的双策略架构</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+vLLM V0 同时支持 swap 和 recompute 两种抢占策略，默认使用 swap。这个设计反映了 vLLM 最初论文（2023 年）发表时的硬件环境和设计假设：
+</p>
+
+<ul>
+<li><p>当时主流的推理场景是相对较短的序列（&lt; 2048 tokens）</p></li>
+<li><p>KV Cache 规模相对可控</p></li>
+<li><p>系统设计重点是减少冗余计算</p></li>
+</ul>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+然而，随着 vLLM 在生产环境中的广泛部署，swap 策略暴露出越来越多的问题。
+</p>
+
+<h3>V1 的决策：统一使用 Recompute</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+vLLM V1 在架构上做出了一个重要简化：<b>移除 swap 机制，统一使用 recompute 作为唯一的抢占策略</b>。这个决策背后有多重原因：
+</p>
+
+<p><b>原因一：Swap 的性能瓶颈在实际部署中日益突出</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+随着模型规模增大和上下文窗口扩展（4K → 32K → 128K+），KV Cache 的体积急剧膨胀。以 LLaMA-70B 模型、128K 上下文为例，单个请求的 KV Cache 可能超过 10 GB。在这种规模下：
+</p>
+
+<ul>
+<li><p>PCIe 传输时间从毫秒级膨胀到秒级（10GB / 32GB/s ≈ 312ms，考虑协议开销和碎片化实际更长）</p></li>
+<li><p>传输期间 GPU 可能出现计算空闲（bubble），抵消了"省下重算"的收益</p></li>
+<li><p>CPU 内存的压力也变得不可接受——同时换出几个长序列就可能耗尽数百 GB 的主机内存</p></li>
+</ul>
+
+<p><b>原因二：Recompute 与 Chunked Prefill 的协同效应</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+vLLM V1 引入了 chunked prefill（分块预填充）作为默认的 prefill 执行策略。在 chunked prefill 下，prefill 计算被拆分成较小的 chunk，与 decode 请求交错执行。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这意味着 recompute（本质上就是一次 prefill）可以被自然地分块并融入正常的调度循环中，而不会造成大的延迟尖峰：
+</p>
+
+<pre class="codeblock">
+传统 Recompute:
+  [====== 长 Prefill（阻塞其他 decode） ======][decode][decode]...
+
+Chunked Prefill + Recompute:
+  [prefill_chunk1 + decode_batch][prefill_chunk2 + decode_batch][...]
+   ↑ 重算被均匀分摊到多个 iteration 中，对其他请求的影响大幅降低
+</pre>
+
+<div class="callout">
+这一协同效应使得 recompute 的"重算延迟"问题在实践中大幅缓解。
+</div>
+
+<p><b>原因三：Prefix Caching 进一步降低重算成本</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+vLLM V1 将 Automatic Prefix Caching（APC）作为默认开启的特性。当一个被抢占的请求需要 recompute 时，其 prompt 部分的 KV Cache 很可能仍然存在于 prefix cache 中（被其他共享相同前缀的请求保留着）。因此 recompute 实际只需要重算 prompt 之后的已生成 token 部分，进一步减少了计算量：
+</p>
+
+<pre class="codeblock">
+原始请求:  [system_prompt | user_input | generated_tokens]
+            ↑ 这部分通常可以命中 prefix cache，无需重算
+                              ↑ 只需重算这部分
+</pre>
+
+<p><b>原因四：架构简化带来的工程收益</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+同时维护 swap 和 recompute 两套代码路径意味着：
+</p>
+
+<ul>
+<li><p>两倍的测试矩阵（每个功能都需要在两种模式下测试）</p></li>
+<li><p>异步传输管理的复杂错误处理逻辑</p></li>
+<li><p>KV Cache 在 GPU 和 CPU 之间的一致性维护</p></li>
+<li><p>与其他特性（如 prefix caching、speculative decoding、tensor parallelism）的交叉兼容问题</p></li>
+</ul>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+统一为 recompute 后，代码路径大幅简化，新功能的开发和调试效率显著提高。
+</p>
+
+<p><b>原因五：Recompute 对硬件的适应性更好</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+Recompute 策略不依赖 PCIe 带宽和 CPU 内存容量这些"外部"资源，只依赖 GPU 本身的算力。随着 GPU 算力的增长速度远超 PCIe 带宽增速（GPU 算力每代翻倍，PCIe 带宽每代仅增长约 60-100%），recompute 的相对优势在持续扩大。
+</p>
+
+<h3>实践启示</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+vLLM V1 的这个决策体现了一个工程哲学：<b>在性能差异不大的情况下，选择更简洁的方案</b>。Swap 和 recompute 在很多场景下的性能差异是边际性的，但 swap 带来的架构复杂度是实质性的。这种"先简化再优化"的策略在分布式系统设计中非常常见。
+</p>
+
+<div class="callout warn">
+当然，这个决策并不意味着 swap 在所有场景下都劣于 recompute。对于某些极端场景（如超长序列 + PCIe Gen5 + 充裕 CPU 内存），swap 仍然可能更优。但 vLLM V1 选择为 80% 的场景优化，而不是为 100% 的场景保留复杂度。
+</div>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.2.4 前缀缓存感知与 SLA 感知调度</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+基础调度策略（FCFS/SJF/优先级）只关注请求本身的属性。在生产环境中，还需要考虑两个关键维度：KV Cache 的复用机会（前缀缓存感知）和服务质量保障（SLA 感知）。
+</p>
+
+<h3>前缀缓存感知调度（Prefix-Cache-Aware Scheduling）</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>核心思想</b>：如果某个请求的 prompt 前缀在 GPU KV Cache 中已经存在（由之前的请求缓存下来），那么优先调度这个请求可以跳过大量 prefill 计算，显著提升系统吞吐。
+</p>
+
+<p><b>为什么前缀缓存会大面积出现？</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在实际部署中，很多请求天然共享前缀：
+</p>
+
+<ul>
+<li><p><b>System Prompt 共享</b>：同一应用的所有请求通常使用相同的系统提示词</p></li>
+<li><p><b>Few-shot 示例共享</b>：同类任务的请求包含相同的示例</p></li>
+<li><p><b>Multi-turn 对话</b>：同一对话的连续请求共享之前的对话历史</p></li>
+<li><p><b>文档问答</b>：多个用户对同一篇文档提问，共享文档内容前缀</p></li>
+</ul>
+
+<pre class="codeblock">
+请求 A: [system_prompt | doc_content | question_1]
+请求 B: [system_prompt | doc_content | question_2]
+请求 C: [system_prompt | different_doc | question_3]
+
+如果 A 先执行，[system_prompt | doc_content] 的 KV Cache 被缓存
+→ 调度 B 时可以跳过这部分 prefill（cache hit）
+→ 调度 C 时只能命中 [system_prompt]（partial hit）
+
+前缀缓存感知调度器会优先选择 B，因为 cache hit 更多
+</pre>
+
+<p><b>调度策略设计</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+前缀缓存感知调度器在选择下一个调度的请求时，需要额外考虑一个因素：该请求与当前 KV Cache 的前缀匹配长度。一种简单的实现方式是修改优先级计算：
+</p>
+
+<pre class="codeblock">
+# 伪代码：前缀缓存感知的优先级计算
+def compute_priority(request, cache_state):
+    base_priority = fcfs_priority(request)  # 基础 FCFS 优先级
+
+    # 计算与缓存的前缀匹配长度
+    prefix_match_len = cache_state.longest_prefix_match(request.prompt_tokens)
+
+    # 匹配越长，节省的计算越多，优先级 boost 越大
+    cache_bonus = prefix_match_len / request.total_prompt_len
+
+    return base_priority + β * cache_bonus
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+其中 β 控制 cache 命中对调度优先级的影响权重。
+</p>
+
+<p><b>更进一步：局部性感知的请求路由</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在多实例部署场景下，前缀缓存感知可以扩展到请求路由层面——将具有相同前缀的请求路由到同一个 vLLM 实例，以最大化该实例上的 cache 命中率。这就是 SGLang 等系统中 "RadixAttention" 配合路由策略的思路。
+</p>
+
+<pre class="codeblock">
+Router 层:
+  请求 [system_A | ...] → 路由到 Instance 1（已缓存 system_A）
+  请求 [system_B | ...] → 路由到 Instance 2（已缓存 system_B）
+  请求 [system_A | ...] → 路由到 Instance 1（命中缓存）
+</pre>
+
+<div class="callout warn">
+这里需要注意的权衡是：过度追求 cache 命中可能导致负载不均衡。如果所有 system_A 的请求都路由到 Instance 1，而 system_A 的流量突增，Instance 1 会过载而其他实例闲置。因此需要在 cache 亲和性和负载均衡之间找到平衡。
+</div>
+
+<h3>SLA 感知调度（SLA-Aware Scheduling）</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>SLA（Service Level Agreement）</b> 定义了每个请求需要满足的服务质量指标。在 LLM 推理中，常见的 SLA 指标包括：
+</p>
+
+<ul>
+<li><p><b>TTFT（Time To First Token）</b>：第一个 token 的响应时间。对交互式场景至关重要——用户期望在几百毫秒内看到第一个字。</p></li>
+<li><p><b>TPOT（Time Per Output Token）</b>：每个 output token 的平均生成时间。决定了用户感知的"打字速度"。</p></li>
+<li><p><b>TBT（Time Between Tokens）</b>：相邻两个 token 之间的间隔。如果间隔突然变长（抖动大），用户会感到卡顿。</p></li>
+<li><p><b>E2E Latency（End-to-End Latency）</b>：请求从提交到完成的总时间。对离线批处理场景更重要。</p></li>
+</ul>
+
+<p><b>为什么需要 SLA 感知？</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+不同类型的请求对 SLA 指标的敏感度完全不同：
+</p>
+
+<table class="comparison">
+<tr><th>请求类型</th><th>关键 SLA</th><th>容忍度</th></tr>
+<tr><td>交互式聊天</td><td>TTFT &lt; 500ms, TPOT &lt; 50ms</td><td>延迟敏感，吞吐次之</td></tr>
+<tr><td>流式代码补全</td><td>TTFT &lt; 200ms, TBT 稳定</td><td>极度延迟敏感</td></tr>
+<tr><td>离线摘要生成</td><td>E2E &lt; 30s</td><td>吞吐优先，延迟可容忍</td></tr>
+<tr><td>批量数据标注</td><td>无严格延迟要求</td><td>仅关注吞吐和成本</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+如果所有请求用同一个 FCFS 策略调度，一个大批量数据标注任务可能占满 batch，导致交互式聊天请求排队等候——即使从业务价值角度，聊天请求的优先级远高于批量标注。
+</p>
+
+<p><b>SLA 感知调度的核心机制</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+SLA 感知调度器将每个请求的 SLA 约束纳入调度决策。最直接的方式是 <b>deadline-aware 调度</b>——为每个请求计算一个隐式 deadline，根据 deadline 的紧迫程度决定优先级：
+</p>
+
+<pre class="codeblock">
+# 伪代码：SLA-aware 调度
+def compute_sla_priority(request, current_time):
+    if request.state == WAITING:
+        # TTFT SLA: 距离 TTFT deadline 越近，优先级越高
+        ttft_deadline = request.arrival_time + request.sla.max_ttft
+        ttft_slack = ttft_deadline - current_time
+        return 1.0 / max(ttft_slack, epsilon)  # slack 越小，优先级越高
+
+    elif request.state == RUNNING:
+        # TPOT SLA: 监控生成速率是否满足要求
+        actual_tpot = (current_time - request.first_token_time) / request.generated_tokens
+        tpot_ratio = actual_tpot / request.sla.max_tpot
+        return tpot_ratio  # 比率越高（越接近违反 SLA），越需要保护
+</pre>
+
+<p><b>SLA 感知的抢占决策</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+SLA 感知不仅影响准入顺序，还影响抢占目标的选择。当需要抢占时，应该优先驱逐 SLA 余量最大（最不紧迫）的请求：
+</p>
+
+<pre class="codeblock">
+Running Batch: [R1(TTFT已满足, TPOT余量20%),
+                R2(TTFT已满足, TPOT余量80%),
+                R3(TTFT已满足, TPOT余量50%)]
+新到达:        R4(TTFT deadline 即将到期!)
+
+→ 抢占 R2（TPOT 余量最大，最"扛得住"被暂停）
+→ 准入 R4（紧急满足其 TTFT 要求）
+</pre>
+
+<p><b>SLA 分级与混合部署</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在实际生产中，一种常见的做法是将请求分为少数几个 SLA 等级，而不是为每个请求单独设置 SLA。例如 Anthropic 的 API 提供了不同的 tier，不同 tier 对应不同的速率限制和延迟保障。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+一种架构模式是将不同 SLA 等级的请求部署在不同的实例池中（物理隔离），以避免互相干扰：
+</p>
+
+<pre class="codeblock">
+高 SLA 池（低延迟保障）:  Instance 1-10  ← 交互式请求
+低 SLA 池（高吞吐优先）:  Instance 11-30 ← 批量请求
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+但这种方式的 GPU 利用率较低（池之间不能动态共享资源）。更先进的做法是在同一组实例上混合部署，通过调度器的 SLA 感知能力实现逻辑隔离——高 SLA 请求总是优先获得资源，低 SLA 请求在空闲时填充利用率。
+</p>
+
+<h3>前缀缓存感知 + SLA 感知的联合调度</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在实际系统中，前缀缓存感知和 SLA 感知需要联合考虑。这可能产生冲突：
+</p>
+
+<ul>
+<li><p><b>场景</b>：请求 A 的 SLA 更紧迫，但请求 B 有更好的 cache 命中率</p></li>
+<li><p><b>权衡</b>：先调度 B 可以更快地完成（利用 cache），释放资源后再调度 A；或者先调度 A 以保证 SLA 不违约</p></li>
+</ul>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这类多目标优化没有通用的最优解，需要根据具体业务场景调整权重。一种实用的启发式是：<b>SLA 约束作为硬约束（必须满足），cache 亲和性作为软优化（尽量满足）</b>。即在所有能满足 SLA 的调度方案中，选择 cache 命中率最高的那个。
+</p>
+
+<pre class="codeblock">
+def joint_scheduling(waiting_queue, cache_state, current_time):
+    # 第一步：过滤出 SLA 紧迫的请求（deadline 即将到期）
+    urgent = [r for r in waiting_queue
+              if r.ttft_slack(current_time) &lt; URGENT_THRESHOLD]
+
+    if urgent:
+        # 紧迫请求中，优先选择 cache 命中率最高的
+        return max(urgent, key=lambda r: cache_state.prefix_match(r))
+    else:
+        # 非紧迫情况下，综合 FCFS 顺序和 cache 命中率
+        return max(waiting_queue,
+                   key=lambda r: w1 * fcfs_score(r) + w2 * cache_score(r))
+</pre>
+
+<h3>小结</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+推理调度是连接"硬件资源"和"用户体验"的桥梁。从朴素的 FCFS 到 SLA 感知的联合调度，调度策略的演进反映了 LLM 推理系统从实验室走向生产环境的过程：
+</p>
+
+<ul>
+<li><p><b>FCFS</b> 提供了基线公平性，适合负载均匀的场景</p></li>
+<li><p><b>SJF/优先级</b> 优化了特定指标，但引入了饥饿风险</p></li>
+<li><p><b>抢占机制</b> 提供了资源弹性，vLLM V1 统一选择 recompute 是工程简洁性胜出的典型案例</p></li>
+<li><p><b>前缀缓存感知</b> 利用 KV Cache 复用提升吞吐</p></li>
+<li><p><b>SLA 感知</b> 保障服务质量，支撑商业化部署</p></li>
+</ul>
+
+<div class="callout">
+在实际系统中，这些策略通常是组合使用的，调度器需要在多个维度上做出实时权衡。调度器的质量，往往是区分"能跑通 demo"和"能上线生产"的关键因素之一。
+</div>
+
+</div>
+
+<div id="footer">
+<div id="footer-text"></div>
+</div>
+
+<p><center>
+&copy; Xiaoyi | <a href="index.html">Homepage</a>
+</center></p>
+
+</body>
+</html>

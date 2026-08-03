@@ -1,0 +1,529 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+<link rel="shortcut icon" href="myIcon.ico">
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+<meta name="keywords" content="W4A16, Dequantization, Quantized Inference, Triton Kernel, GEMM, 反量化推理">
+<meta name="description" content="W4A16 Dequantization Inference: On-chip Dequant + GEMM Fusion">
+<link rel="stylesheet" href="jemdoc.css" type="text/css">
+<title>Dequantized Inference — 反量化推理（W4A16）</title>
+<style>
+/* ── Extra styles scoped to this article ── */
+pre.codeblock {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 12px 0 18px;
+}
+.callout {
+    border-left: 3px solid #2563EB;
+    background: #EFF6FF;
+    padding: 10px 14px;
+    margin: 14px 0;
+    font-size: 14px;
+}
+.callout.warn {
+    border-left-color: #F59E0B;
+    background: #FFFBEB;
+}
+.callout.negative {
+    border-left-color: #EF4444;
+    background: #FEF2F2;
+}
+table.comparison {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 14px 0 18px;
+    font-size: 14px;
+}
+table.comparison th {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+}
+table.comparison td {
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+}
+.formula-box {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 14px 20px;
+    border-radius: 6px;
+    margin: 12px 0 18px;
+    line-height: 1.8;
+}
+.back-link {
+    font-size: 13px;
+    margin-bottom: 20px;
+    display: block;
+}
+</style>
+</head>
+<body>
+
+<div id="layout-content" style="margin-top:25px">
+
+<a class="back-link" href="index.html">&larr; Back to homepage</a>
+
+<div id="toptitle">
+<h1>8.6 反量化推理（W4A16）</h1>
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+上一节我们讨论了权重量化的离线过程：如何把 FP16 权重压缩成 INT4 并保存 scale、zero-point 等量化元数据。本节关注的是硬币的另一面——<b>推理时如何高效地使用这些 INT4 权重</b>。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+所谓 W4A16，指的是权重（Weight）以 4-bit 整数存储，而激活值（Activation）仍保持 16-bit 浮点（FP16/BF16）的推理方案。这是 GPTQ、AWQ 等主流权重量化方法在部署时的标准形态。它的核心矛盾在于：<b>现代 GPU 的 Tensor Core 并不存在 "INT4 &times; FP16" 这样的混合精度乘法指令</b>。INT4 权重在参与矩阵乘之前，必须先被"反量化"（dequantize）回 FP16。问题是——这一步反量化应该发生在哪里？做得不好，量化带来的全部带宽收益会被瞬间抹平；做得好，则能让解码阶段的矩阵乘获得接近 4 倍的加速。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+本节先从数据流的角度分析"片上反量化 + GEMM 融合"这一关键设计（8.6.1），再用 Roofline 模型解释 W4A16 为什么在小 batch 下收益巨大、在大 batch 下反而可能变慢（8.6.2），最后动手实现一个完整的 W4A16 反量化矩阵乘 Triton kernel，并与 PyTorch 参考实现对拍验证（8.6.3）。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>8.6.1 片上反量化与 GEMM 的融合</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>朴素方案的陷阱：先反量化，再做 GEMM</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+拿到一份 INT4 权重后，最直观的推理方式是分两步走：
+</p>
+
+<pre class="codeblock">
+方案 A（朴素两段式）:
+  Step 1: dequant_kernel   —— 读取 INT4 权重 + scale/zero，写出完整的 FP16 权重矩阵到显存
+  Step 2: cublas_gemm      —— 用 cuBLAS 对 FP16 激活 × FP16 权重 做标准矩阵乘
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这个方案功能上完全正确，但从访存角度看是一场灾难。以一个 <code>K=4096, N=4096</code> 的权重矩阵为例：
+</p>
+
+<ul>
+<li><p>Step 1 需要从 HBM 读入约 8 MB 的 INT4 权重（4096&times;4096&times;0.5 字节），再向 HBM <b>写出 32 MB</b> 的 FP16 权重；</p></li>
+<li><p>Step 2 又要把这 32 MB 的 FP16 权重<b>重新从 HBM 读回来</b>。</p></li>
+</ul>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+一来一回，权重相关的 HBM 流量是 8 + 32 + 32 = 72 MB，反而比直接用 FP16 权重（32 MB）多了一倍以上。此外还需要额外分配一块 FP16 权重的临时显存。量化省下的存储空间和带宽，在推理路径上被完全浪费了——INT4 只剩下"模型文件更小、加载更快"这一点好处。
+</p>
+
+<div class="callout negative">
+<b>方案 A 的致命问题</b>：反量化后的 FP16 权重落回 HBM，然后 GEMM 又要重新读取。权重相关的 HBM 流量（72 MB）反而是直接用 FP16 权重（32 MB）的两倍多——量化的带宽收益被完全浪费。
+</div>
+
+<h3>融合方案：让反量化只发生在片上</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+正确的做法是把反量化<b>融合进 GEMM kernel 内部</b>，让 FP16 形态的权重只存在于 GPU 的片上存储（寄存器 / shared memory）中，从始至终不落回 HBM：
+</p>
+
+<pre class="codeblock">
+方案 B（融合式，W4A16 的标准做法）:
+
+  HBM ──(INT4 packed 权重, 0.5 B/元素)──▶ 寄存器/Shared Memory
+                                              │
+                                        片上反量化
+                                    w = (q - zero) * scale
+                                              │
+                                              ▼
+  HBM ──(FP16 激活)──────────────────▶  tl.dot / Tensor Core (FP16 × FP16)
+                                              │
+                                              ▼
+                                        FP16 结果写回 HBM
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在融合方案中，每个线程块在 K 维上分块循环时，做的事情是：
+</p>
+
+<ol>
+<li><p>从 HBM 加载一小块<b>打包的 INT4 权重</b>（通常 8 个 4-bit 值打包进一个 <code>int32</code>）；</p></li>
+<li><p>在寄存器中用移位和按位与指令把 4-bit 数解包出来；</p></li>
+<li><p>加载对应分组（group）的 <code>scale</code> 和 <code>zero</code>，在片上完成 <code>w = (q - zero) &times; scale</code>；</p></li>
+<li><p>把反量化得到的 FP16 小块直接喂给 <code>tl.dot</code>（底层映射到 Tensor Core 的 MMA 指令）；</p></li>
+<li><p>累加进 FP32 累加器，进入下一个 K 分块。</p></li>
+</ol>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这样一来，权重在 HBM 侧的流量就只有 INT4 本身（外加占比很小的 scale/zero 元数据），相比 FP16 GEMM 减少到约 1/4。<b>反量化的计算成本（移位、减法、乘法）被"藏"进了原本就在等待访存的空闲计算周期里</b>——这正是访存受限 kernel 融合的经典收益模式，与第 7 章讨论的逐元素算子融合一脉相承。
+</p>
+
+<h3>融合 kernel 需要处理的三个工程细节</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>（1）位打包布局（bit-packing layout）。</b> 4-bit 不是任何硬件的原生存储粒度，必须打包进 <code>int8</code> 或 <code>int32</code>。常见做法是沿 K 维把 8 个连续的 4-bit 量化值塞进一个 <code>int32</code>：第 <code>k</code> 个值占据第 <code>(k mod 8)</code> 个 nibble（4-bit 槽位）。这样打包后的权重张量形状从 <code>(K, N)</code> 变为 <code>(K/8, N)</code>。kernel 内解包只需两条指令：
+</p>
+
+<pre class="codeblock">
+q[k, n] = (packed[k // 8, n] &gt;&gt; ((k % 8) * 4)) &amp; 0xF
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+生产级实现（如 Marlin、ExLlamaV2）会进一步设计更复杂的交织（interleaved）布局，让解包出来的数据恰好符合 Tensor Core MMA 指令要求的寄存器排布，省掉片上的重排开销。本章的教学实现采用上面这种最直观的顺序布局。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>（2）分组量化元数据的读取。</b> 第 8.2 节介绍过，为了控制量化误差，W4 通常按 <code>group_size = 128</code> 沿 K 维分组，每组独立拥有一对 <code>(scale, zero)</code>。融合 kernel 在处理第 <code>k</code> 行权重时需要索引到第 <code>k // group_size</code> 组的元数据。元数据本身很小（每 128 个权重共享 2 个标量），带宽占比不足 3%，但要注意让 <code>BLOCK_K</code> 与 <code>group_size</code> 对齐（例如 <code>BLOCK_K = 64</code>、<code>group_size = 128</code>），避免一个 K 分块横跨两个 group 导致的分支处理。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>（3）反量化指令与 MMA 的流水重叠。</b> 解包用的是 INT32 ALU，矩阵乘用的是 Tensor Core，二者是 SM 上不同的执行单元。写得好的 kernel 会让"下一块权重的加载与解包"和"当前块的 MMA 计算"重叠起来（软件流水 / double buffering）。在 Triton 中，编译器的自动流水（<code>num_stages</code>）通常能帮我们完成大部分工作；而在 CUDA 手写实现中，这是 Marlin 这类 kernel 性能领先的关键所在。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>8.6.2 从 I/O 受限到计算受限的转变</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+W4A16 的收益并非无条件成立。用第 2 章的 Roofline 模型可以精确刻画它的适用边界，结论是：<b>W4A16 是为访存受限（memory-bound）场景设计的技术；随着 batch 增大、GEMM 逐渐转入计算受限（compute-bound）区间，它的收益会衰减，甚至由于额外的反量化开销而变为负收益。</b>
+</p>
+
+<h3>解码阶段：深陷访存受限区，收益接近 4 倍</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+LLM 自回归解码时，每一步每个请求只处理 1 个 token。对于单请求（<code>M = 1</code>）的一层线性层 <code>(1, K) &times; (K, N)</code>，其算术强度（Arithmetic Intensity, AI）为：
+</p>
+
+<div class="formula-box">
+AI = 2KN (FLOPs) / [2K (激活) + b_w &middot; KN (权重) + 2N (输出)] (Bytes)
+   &asymp; 2 / b_w  (FLOPs/Byte)
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+其中 b<sub>w</sub> 是权重每元素的字节数。当 K、N 都在几千的量级时，激活和输出的流量可以忽略，访存几乎完全由权重主导：
+</p>
+
+<ul>
+<li><p>FP16 权重（b<sub>w</sub> = 2）：AI &asymp; 1 FLOP/Byte；</p></li>
+<li><p>INT4 权重（b<sub>w</sub> = 0.5）：AI &asymp; 4 FLOPs/Byte。</p></li>
+</ul>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+而以 A100 为例，其"屋脊拐点"位于 312 TFLOPS &divide; 2.0 TB/s &asymp; 156 FLOPs/Byte。无论 FP16 还是 INT4，解码 GEMV 的算术强度都远远低于拐点，深陷屋檐（带宽斜线）之下。在这个区间里，<b>kernel 的执行时间 &asymp; 访存字节数 &divide; 带宽</b>，与计算量几乎无关。因此把权重字节数压到 1/4，理论上就能把这条 GEMV 的延迟压到约 1/4——这正是 W4A16 在低并发在线推理中大受欢迎的根本原因。反量化增加的那点整数指令，在带宽瓶颈面前完全"免费"。
+</p>
+
+<h3>batch 增大：交叉点提前到来</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+当 batch（或 prefill 的序列长度）为 M 时，<code>(M, K) &times; (K, N)</code> 的算术强度变为：
+</p>
+
+<div class="formula-box">
+AI(M) = 2MNK / [2MK + b_w &middot; KN + 2MN]
+      &asymp; 2M / b_w   (当 M &lt;&lt; K, N)
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+权重只需从 HBM 读取一次，却被 M 行激活复用，所以算术强度近似随 M 线性增长。令 AI(M) 达到硬件拐点 156，可以解出进入计算受限区的临界 batch：
+</p>
+
+<table class="comparison">
+<tr><th>权重精度</th><th>近似算术强度</th><th>到达 A100 拐点的临界 M</th></tr>
+<tr><td>FP16（b<sub>w</sub> = 2）</td><td>&asymp; M</td><td>M &asymp; 156</td></tr>
+<tr><td>INT4（b<sub>w</sub> = 0.5）</td><td>&asymp; 4M</td><td>M &asymp; 39</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这张表揭示了一个关键事实：<b>INT4 让 kernel 以 4 倍的速度逼近计算受限区</b>。当 M 超过临界值后，时间瓶颈从 HBM 带宽切换为 Tensor Core 吞吐——而 W4A16 的 MMA 仍然是 FP16 &times; FP16，峰值算力与普通 FP16 GEMM 完全相同，省带宽不再省时间。更糟的是，此时片上反量化的移位/乘加指令、以及为解包引入的非理想数据布局，开始与主计算争抢发射槽和寄存器，使得 W4A16 kernel 在大 M 下往往<b>慢于</b> cuBLAS 的纯 FP16 GEMM。
+</p>
+
+<h3>工程上的推论</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这一分析直接解释了主流推理框架的几个设计决策：
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>decode 与 prefill 分而治之。</b> decode（小 M）走 W4A16 融合 kernel；prefill 或大 batch 场景（大 M）有些框架会退回"先整块反量化、再调 cuBLAS"的两段式，或使用 Marlin 这类专门把大 M 区间也优化到接近 FP16 GEMM 水平的 kernel。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>量化的主要卖点是延迟和显存，而非吞吐。</b> 在高并发、大 batch 的吞吐型服务里，GEMM 本就接近计算受限，W4A16 的加速空间有限；它真正的战场是显存吃紧的单卡部署和对首 token/逐 token 延迟敏感的在线场景。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>优化目标应随 M 漂移。</b> 写 W4A16 kernel 时，小 M 区间应最大化访存效率（合并访问、L2 命中），大 M 区间则要把反量化开销从关键路径上藏起来（流水重叠、指令级并行）。8.6.3 的教学 kernel 以正确性和可读性优先，性能调优的方向会在末尾指出。
+</p>
+
+<div class="callout warn">
+<b>核心结论</b>：W4A16 在 A100 上的收益拐点大约在 M &asymp; 39。低于此值时收益接近理论 4&times;，高于此值后收益急剧衰减。这一结论在 8.6.3 的 benchmark 实验中会得到验证。
+</div>
+
+<!-- ════════════════════════════════════════ -->
+<h2>8.6.3 代码实战：反量化矩阵乘 Triton kernel 与对拍测试</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+下面实现一个完整可运行的 W4A16 流水线，包含四个部分：① 权重量化与位打包、② PyTorch 参考反量化、③ 融合反量化的 Triton GEMM kernel、④ 对拍测试与简单性能测量。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+约定与 8.6.1 一致：8 个 4-bit 值沿 K 维打包进一个 <code>int32</code>；按 <code>group_size = 128</code> 沿 K 维分组做非对称量化，量化值 <code>q &isin; [0, 15]</code>，反量化公式为 <code>w = (q - zero) * scale</code>。
+</p>
+
+<h3>第一步：权重量化与位打包（离线，PyTorch 实现）</h3>
+
+<pre class="codeblock">
+<span style="color:#94A3B8;">import</span> torch
+<span style="color:#94A3B8;">import</span> triton
+<span style="color:#94A3B8;">import</span> triton.language <span style="color:#94A3B8;">as</span> tl
+
+
+<span style="color:#94A3B8;">def</span> <span style="color:#7DD3FC;">quantize_pack_w4</span>(w: torch.Tensor, group_size: <span style="color:#94A3B8;">int</span> = <span style="color:#F9A8D4;">128</span>):
+    <span style="color:#6EE7B7;">"""把 FP16 权重 w (K, N) 量化为 INT4 并沿 K 维打包进 int32。
+
+    返回:
+        packed: (K // 8, N) int32，每个 int32 装 8 个 4-bit 量化值
+        scales: (K // group_size, N) float16
+        zeros:  (K // group_size, N) int32
+    """</span>
+    K, N = w.shape
+    <span style="color:#94A3B8;">assert</span> K % group_size == <span style="color:#F9A8D4;">0</span> <span style="color:#94A3B8;">and</span> K % <span style="color:#F9A8D4;">8</span> == <span style="color:#F9A8D4;">0</span>
+
+    wg = w.float().reshape(K // group_size, group_size, N)
+    w_max = wg.amax(dim=<span style="color:#F9A8D4;">1</span>, keepdim=<span style="color:#94A3B8;">True</span>)
+    w_min = wg.amin(dim=<span style="color:#F9A8D4;">1</span>, keepdim=<span style="color:#94A3B8;">True</span>)
+
+    scales = ((w_max - w_min) / <span style="color:#F9A8D4;">15.0</span>).clamp(min=<span style="color:#F9A8D4;">1e-8</span>)      <span style="color:#64748B;"># 4-bit → 16 个量化格点</span>
+    zeros = torch.round(-w_min / scales).clamp(<span style="color:#F9A8D4;">0</span>, <span style="color:#F9A8D4;">15</span>)       <span style="color:#64748B;"># 非对称零点</span>
+
+    q = torch.round(wg / scales + zeros).clamp(<span style="color:#F9A8D4;">0</span>, <span style="color:#F9A8D4;">15</span>).to(torch.int32)
+    q = q.reshape(K, N)
+
+    <span style="color:#64748B;"># 位打包：第 k 个值占据 packed[k // 8] 的第 (k % 8) 个 nibble</span>
+    packed = torch.zeros(K // <span style="color:#F9A8D4;">8</span>, N, dtype=torch.int32, device=w.device)
+    <span style="color:#94A3B8;">for</span> i <span style="color:#94A3B8;">in</span> range(<span style="color:#F9A8D4;">8</span>):
+        packed |= q[i::<span style="color:#F9A8D4;">8</span>, :] &lt;&lt; (<span style="color:#F9A8D4;">4</span> * i)
+
+    <span style="color:#94A3B8;">return</span> (packed,
+            scales.reshape(K // group_size, N).to(torch.float16),
+            zeros.reshape(K // group_size, N).to(torch.int32))
+
+
+<span style="color:#94A3B8;">def</span> <span style="color:#7DD3FC;">dequantize_ref</span>(packed, scales, zeros, group_size: <span style="color:#94A3B8;">int</span> = <span style="color:#F9A8D4;">128</span>):
+    <span style="color:#6EE7B7;">"""参考实现：解包 + 反量化，还原出完整 FP16 权重，用于对拍。"""</span>
+    Kp, N = packed.shape
+    K = Kp * <span style="color:#F9A8D4;">8</span>
+    q = torch.empty(K, N, dtype=torch.int32, device=packed.device)
+    <span style="color:#94A3B8;">for</span> i <span style="color:#94A3B8;">in</span> range(<span style="color:#F9A8D4;">8</span>):
+        q[i::<span style="color:#F9A8D4;">8</span>, :] = (packed &gt;&gt; (<span style="color:#F9A8D4;">4</span> * i)) &amp; <span style="color:#F9A8D4;">0xF</span>
+
+    s = scales.repeat_interleave(group_size, dim=<span style="color:#F9A8D4;">0</span>).float()   <span style="color:#64748B;"># (K, N)</span>
+    z = zeros.repeat_interleave(group_size, dim=<span style="color:#F9A8D4;">0</span>)            <span style="color:#64748B;"># (K, N)</span>
+    <span style="color:#94A3B8;">return</span> ((q - z).float() * s).to(torch.float16)
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+两点说明。其一，打包循环里 <code>q[i::8, :]</code> 取出的是第 <code>i, i+8, i+16, &hellip;</code> 行，恰好对应每个 <code>int32</code> 中的第 <code>i</code> 个 nibble，与 kernel 内 <code>(k % 8) * 4</code> 的移位规则严格互逆。其二，<code>packed</code> 是有符号 <code>int32</code>，最高 nibble 的解包会触发算术右移（符号位扩展），但随后 <code>&amp; 0xF</code> 只保留低 4 位，结果依然正确——这个细节在 Triton kernel 里同样成立。
+</p>
+
+<h3>第二步：融合反量化的 Triton GEMM kernel</h3>
+
+<pre class="codeblock">
+<span style="color:#7DD3FC;">@triton.jit</span>
+<span style="color:#94A3B8;">def</span> <span style="color:#7DD3FC;">w4a16_gemm_kernel</span>(
+    a_ptr, bq_ptr, scales_ptr, zeros_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,      <span style="color:#64748B;"># A:      (M, K)     fp16</span>
+    stride_bk, stride_bn,      <span style="color:#64748B;"># packed: (K//8, N)  int32</span>
+    stride_sg, stride_sn,      <span style="color:#64748B;"># scales: (K//G, N)  fp16</span>
+    stride_zg, stride_zn,      <span style="color:#64748B;"># zeros:  (K//G, N)  int32</span>
+    stride_cm, stride_cn,      <span style="color:#64748B;"># C:      (M, N)     fp16</span>
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(<span style="color:#F9A8D4;">0</span>)
+    pid_n = tl.program_id(<span style="color:#F9A8D4;">1</span>)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(<span style="color:#F9A8D4;">0</span>, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(<span style="color:#F9A8D4;">0</span>, BLOCK_N)
+    offs_k = tl.arange(<span style="color:#F9A8D4;">0</span>, BLOCK_K)
+
+    n_mask = offs_n[<span style="color:#94A3B8;">None</span>, :] &lt; N
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    <span style="color:#94A3B8;">for</span> k0 <span style="color:#94A3B8;">in</span> range(<span style="color:#F9A8D4;">0</span>, K, BLOCK_K):          <span style="color:#64748B;"># 假设 K % BLOCK_K == 0</span>
+        k = k0 + offs_k                       <span style="color:#64748B;"># (BLOCK_K,) 当前 K 分块的行号</span>
+
+        <span style="color:#64748B;"># ── 1. 加载激活 A 的 FP16 分块 ─────────────────────────────</span>
+        a = tl.load(a_ptr + offs_m[:, <span style="color:#94A3B8;">None</span>] * stride_am + k[<span style="color:#94A3B8;">None</span>, :] * stride_ak,
+                    mask=offs_m[:, <span style="color:#94A3B8;">None</span>] &lt; M, other=<span style="color:#F9A8D4;">0.0</span>)
+
+        <span style="color:#64748B;"># ── 2. 加载打包权重并在寄存器中解包出 4-bit 量化值 ─────────</span>
+        packed = tl.load(bq_ptr + (k[:, <span style="color:#94A3B8;">None</span>] // <span style="color:#F9A8D4;">8</span>) * stride_bk
+                                 + offs_n[<span style="color:#94A3B8;">None</span>, :] * stride_bn,
+                         mask=n_mask, other=<span style="color:#F9A8D4;">0</span>)
+        shift = (k[:, <span style="color:#94A3B8;">None</span>] % <span style="color:#F9A8D4;">8</span>) * <span style="color:#F9A8D4;">4</span>
+        q = (packed &gt;&gt; shift) &amp; <span style="color:#F9A8D4;">0xF</span>           <span style="color:#64748B;"># (BLOCK_K, BLOCK_N) int32</span>
+
+        <span style="color:#64748B;"># ── 3. 加载分组量化元数据，片上反量化 ─────────────────────</span>
+        g = k[:, <span style="color:#94A3B8;">None</span>] // GROUP_SIZE
+        s = tl.load(scales_ptr + g * stride_sg + offs_n[<span style="color:#94A3B8;">None</span>, :] * stride_sn,
+                    mask=n_mask, other=<span style="color:#F9A8D4;">0.0</span>)
+        z = tl.load(zeros_ptr + g * stride_zg + offs_n[<span style="color:#94A3B8;">None</span>, :] * stride_zn,
+                    mask=n_mask, other=<span style="color:#F9A8D4;">0</span>)
+        b = ((q - z).to(tl.float16)) * s      <span style="color:#64748B;"># FP16 权重块，只存在于片上</span>
+
+        <span style="color:#64748B;"># ── 4. Tensor Core 矩阵乘并累加 ──────────────────────────</span>
+        acc += tl.dot(a, b)
+
+    c_mask = (offs_m[:, <span style="color:#94A3B8;">None</span>] &lt; M) &amp; n_mask
+    tl.store(c_ptr + offs_m[:, <span style="color:#94A3B8;">None</span>] * stride_cm + offs_n[<span style="color:#94A3B8;">None</span>, :] * stride_cn,
+             acc.to(tl.float16), mask=c_mask)
+
+
+<span style="color:#94A3B8;">def</span> <span style="color:#7DD3FC;">w4a16_matmul</span>(a, packed, scales, zeros, group_size: <span style="color:#94A3B8;">int</span> = <span style="color:#F9A8D4;">128</span>):
+    M, K = a.shape
+    N = packed.shape[<span style="color:#F9A8D4;">1</span>]
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+
+    BLOCK_M, BLOCK_N, BLOCK_K = <span style="color:#F9A8D4;">16</span>, <span style="color:#F9A8D4;">64</span>, <span style="color:#F9A8D4;">64</span>
+    <span style="color:#94A3B8;">assert</span> K % BLOCK_K == <span style="color:#F9A8D4;">0</span> <span style="color:#94A3B8;">and</span> group_size % BLOCK_K == <span style="color:#F9A8D4;">0</span>
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    w4a16_gemm_kernel[grid](
+        a, packed, scales, zeros, c,
+        M, N, K,
+        a.stride(<span style="color:#F9A8D4;">0</span>), a.stride(<span style="color:#F9A8D4;">1</span>),
+        packed.stride(<span style="color:#F9A8D4;">0</span>), packed.stride(<span style="color:#F9A8D4;">1</span>),
+        scales.stride(<span style="color:#F9A8D4;">0</span>), scales.stride(<span style="color:#F9A8D4;">1</span>),
+        zeros.stride(<span style="color:#F9A8D4;">0</span>), zeros.stride(<span style="color:#F9A8D4;">1</span>),
+        c.stride(<span style="color:#F9A8D4;">0</span>), c.stride(<span style="color:#F9A8D4;">1</span>),
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=<span style="color:#F9A8D4;">4</span>, num_stages=<span style="color:#F9A8D4;">3</span>,
+    )
+    <span style="color:#94A3B8;">return</span> c
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这个 kernel 就是 8.6.1 中方案 B 的直接翻译：整个循环里没有任何 FP16 权重被写回全局内存，<code>b</code> 这个反量化结果的生命周期仅限于寄存器与 <code>tl.dot</code> 之间。注意 <code>group_size % BLOCK_K == 0</code> 的断言保证了每个 K 分块不会横跨量化分组，<code>g = k // GROUP_SIZE</code> 在块内其实是常量，Triton 编译器可以据此做冗余加载消除。
+</p>
+
+<div class="callout">
+<b>关键设计</b>：反量化后的 FP16 权重 <code>b</code> 只存在于 GPU 寄存器中，从不落回全局显存——这正是 8.6.1 所描述的"片上反量化"的核心。
+</div>
+
+<h3>第三步：对拍测试</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+对拍的基准不是"量化前的原始权重"，而是"参考实现反量化出的 FP16 权重"——我们要验证的是 <b>kernel 与参考实现在数值上一致</b>，量化本身的精度损失属于 8.2 节的话题，不应混入此处的判定。
+</p>
+
+<pre class="codeblock">
+<span style="color:#94A3B8;">def</span> <span style="color:#7DD3FC;">test_w4a16</span>(M=<span style="color:#F9A8D4;">8</span>, K=<span style="color:#F9A8D4;">4096</span>, N=<span style="color:#F9A8D4;">4096</span>, group_size=<span style="color:#F9A8D4;">128</span>, seed=<span style="color:#F9A8D4;">0</span>):
+    torch.manual_seed(seed)
+    device = <span style="color:#6EE7B7;">"cuda"</span>
+
+    w = torch.randn(K, N, device=device, dtype=torch.float16) * <span style="color:#F9A8D4;">0.02</span>
+    a = torch.randn(M, K, device=device, dtype=torch.float16)
+
+    packed, scales, zeros = quantize_pack_w4(w, group_size)
+
+    <span style="color:#64748B;"># 参考路径：显式反量化 + torch.matmul</span>
+    w_hat = dequantize_ref(packed, scales, zeros, group_size)
+    ref = a @ w_hat
+
+    <span style="color:#64748B;"># 被测路径：融合 kernel</span>
+    out = w4a16_matmul(a, packed, scales, zeros, group_size)
+
+    torch.testing.assert_close(out, ref, atol=<span style="color:#F9A8D4;">2e-2</span>, rtol=<span style="color:#F9A8D4;">1e-2</span>)
+    max_err = (out.float() - ref.float()).abs().max().item()
+    print(<span style="color:#6EE7B7;">f"[PASS] M={M:>4} K={K} N={N}  max_abs_err={max_err:.4e}"</span>)
+
+
+<span style="color:#94A3B8;">if</span> __name__ == <span style="color:#6EE7B7;">"__main__"</span>:
+    <span style="color:#94A3B8;">for</span> M <span style="color:#94A3B8;">in</span> (<span style="color:#F9A8D4;">1</span>, <span style="color:#F9A8D4;">8</span>, <span style="color:#F9A8D4;">16</span>, <span style="color:#F9A8D4;">33</span>, <span style="color:#F9A8D4;">128</span>):     <span style="color:#64748B;"># 覆盖 GEMV、非对齐 M、大 batch</span>
+        test_w4a16(M=M)
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+容差设为 <code>atol=2e-2</code> 而非机器精度，原因有二：参考路径在 FP16 下做累加（<code>torch.matmul</code> 的 FP16 GEMM 内部虽用 FP32 累加，但反量化本身经过了 FP16 舍入），而 kernel 路径的反量化在 <code>(q - z)</code> 转 FP16 后与 <code>s</code> 相乘，两条路径的舍入位置不同；K=4096 的长累加会把这些微小差异放大。若想收紧对拍，可以让参考路径也严格模拟 kernel 的舍入顺序。
+</p>
+
+<h3>第四步：验证 8.6.2 的预言</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+最后用一个简单的基准测试，观察加速比随 M 的变化：
+</p>
+
+<pre class="codeblock">
+<span style="color:#94A3B8;">def</span> <span style="color:#7DD3FC;">bench</span>(M, K=<span style="color:#F9A8D4;">4096</span>, N=<span style="color:#F9A8D4;">4096</span>, group_size=<span style="color:#F9A8D4;">128</span>):
+    w = torch.randn(K, N, device=<span style="color:#6EE7B7;">"cuda"</span>, dtype=torch.float16) * <span style="color:#F9A8D4;">0.02</span>
+    a = torch.randn(M, K, device=<span style="color:#6EE7B7;">"cuda"</span>, dtype=torch.float16)
+    packed, scales, zeros = quantize_pack_w4(w, group_size)
+
+    t_fp16 = triton.testing.do_bench(<span style="color:#94A3B8;">lambda</span>: a @ w)
+    t_w4   = triton.testing.do_bench(
+        <span style="color:#94A3B8;">lambda</span>: w4a16_matmul(a, packed, scales, zeros, group_size))
+    print(<span style="color:#6EE7B7;">f"M={M:>5}  fp16={t_fp16:.3f} ms  w4a16={t_w4:.3f} ms  "</span>
+          <span style="color:#6EE7B7;">f"speedup={t_fp16 / t_w4:.2f}x"</span>)
+
+<span style="color:#94A3B8;">for</span> M <span style="color:#94A3B8;">in</span> (<span style="color:#F9A8D4;">1</span>, <span style="color:#F9A8D4;">4</span>, <span style="color:#F9A8D4;">16</span>, <span style="color:#F9A8D4;">64</span>, <span style="color:#F9A8D4;">256</span>, <span style="color:#F9A8D4;">1024</span>):
+    bench(M)
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在 A100 上运行，典型的趋势是：<code>M=1~16</code> 时 W4A16 明显快于 FP16（教学实现约 2~3 倍，生产级 kernel 可逼近理论的 4 倍）；<code>M</code> 到几十之后加速比迅速衰减；<code>M</code> 达到数百时被 cuBLAS 反超——与 8.6.2 中"临界 M &asymp; 39 附近发生瓶颈切换"的 Roofline 预测吻合。
+</p>
+
+<h3>与生产级 kernel 的差距</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+本节的实现为可读性做了取舍，与 Marlin、ExLlamaV2 等生产级 W4A16 kernel 的主要差距在于：
+</p>
+
+<table class="comparison">
+<tr><th>维度</th><th>教学实现</th><th>生产级 kernel（Marlin 等）</th></tr>
+<tr><td>scale/zero 加载</td><td>每个 (k, n) 元素独立加载，依赖编译器消除组内冗余</td><td>每组显式只加载一次并广播</td></tr>
+<tr><td>位打包布局</td><td>顺序打包，解包后需隐式重排才能进入 MMA 寄存器布局</td><td>离线交织布局，解包输出零重排直达 Tensor Core</td></tr>
+<tr><td>流水线编排</td><td>依赖 Triton 自动流水（<code>num_stages=3</code>）</td><td>手工编排"全局内存加载 → 解包 → MMA"三级流水</td></tr>
+<tr><td>大 M 区间性能</td><td>反量化开销暴露，显著慢于 cuBLAS FP16</td><td>反量化彻底移出关键路径，接近 FP16 GEMM 吞吐</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+理解了本节的融合结构之后，阅读这些开源 kernel 的源码就只剩下布局细节的差异了。
+</p>
+
+<h3>本节小结</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+W4A16 的本质是一笔"用片上计算换 HBM 带宽"的交易：
+</p>
+
+<ul>
+<li><p>反量化必须融合进 GEMM、只发生在片上，量化才能兑现为速度</p></li>
+<li><p>这笔交易只在访存受限区间有利可图，Roofline 模型给出了收益随 batch 衰减的精确边界</p></li>
+<li><p>对拍测试的正确基准是参考反量化路径，它把"kernel 写没写对"与"量化损失了多少精度"这两个问题干净地分离开来</p></li>
+</ul>
+
+<div class="callout">
+在实际系统中，W4A16 融合 kernel 是权重量化推理的核心加速组件。理解本节的"方案 A vs 方案 B"、Roofline 临界 M、以及对拍验证方法论，是阅读 Marlin、ExLlamaV2、BitBLAS 等生产级源码的必要基础。
+</div>
+
+</div>
+
+<div id="footer">
+<div id="footer-text"></div>
+</div>
+
+<p><center>
+&copy; Xiaoyi | <a href="index.html">Homepage</a>
+</center></p>
+
+</body>
+</html>

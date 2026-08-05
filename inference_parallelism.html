@@ -1,0 +1,719 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+<link rel="shortcut icon" href="myIcon.ico">
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+<meta name="keywords" content="Inference Parallelism, Tensor Parallel, Ring Attention, Context Parallel, Expert Parallel, MoE, 推理并行, KV Cache">
+<meta name="description" content="Inference-side Parallelism for LLM Serving">
+<link rel="stylesheet" href="jemdoc.css" type="text/css">
+<title>Inference Parallelism — 推理侧并行</title>
+<style>
+/* ── Extra styles scoped to this article ── */
+pre.codeblock {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 12px 0 18px;
+}
+.callout {
+    border-left: 3px solid #2563EB;
+    background: #EFF6FF;
+    padding: 10px 14px;
+    margin: 14px 0;
+    font-size: 14px;
+}
+.callout.warn {
+    border-left-color: #F59E0B;
+    background: #FFFBEB;
+}
+.callout.negative {
+    border-left-color: #EF4444;
+    background: #FEF2F2;
+}
+table.comparison {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 14px 0 18px;
+    font-size: 14px;
+}
+table.comparison th {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+}
+table.comparison td {
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+}
+.formula-box {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 14px 20px;
+    border-radius: 6px;
+    margin: 12px 0 18px;
+    line-height: 1.8;
+}
+.back-link {
+    font-size: 13px;
+    margin-bottom: 20px;
+    display: block;
+}
+</style>
+</head>
+<body>
+
+<div id="layout-content" style="margin-top:25px">
+
+<a class="back-link" href="index.html">&larr; Back to homepage</a>
+
+<div id="toptitle">
+<h1>7.4 推理侧并行</h1>
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+前面几节讨论的并行策略，几乎都是围绕"如何把一次训练迭代拆到多个设备上"展开的。推理看似是训练的子集——只做前向传播，似乎更简单——但真正做过部署的人都知道，推理的并行设计有一套完全不同的约束和目标。本节先说清楚这种差异的根源，再分别讨论张量并行、上下文并行和专家并行在推理场景下的具体优化手段。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.4.1 推理与训练并行的差异：无反向、KV Cache 约束</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>计算图的差异：少了三分之二的计算，也少了同步点</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+训练一步的计算量大致是前向的 3 倍。以参数量为 N 的稠密模型为例，每个 token 的计算量可以粗略估算如下：
+</p>
+
+<table class="comparison">
+<tr><th>阶段</th><th>每 token FLOPs（近似）</th><th>说明</th></tr>
+<tr><td>前向</td><td>2N</td><td>每个参数一次乘、一次加</td></tr>
+<tr><td>反向</td><td>4N</td><td>需要同时算 ∂L/∂x 和 ∂L/∂W</td></tr>
+<tr><td>合计（训练）</td><td>6N</td><td>加上重计算还会更多</td></tr>
+<tr><td>推理</td><td>2N</td><td>只有前向</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+去掉反向带来三个直接后果：
+</p>
+
+<ol>
+<li><p><b>不需要保存激活值</b>：训练必须把前向的中间激活留到反向用，激活显存往往和参数显存同量级，这也是重计算（activation checkpointing）、序列并行等技术存在的主要动机。推理算完一层就能释放，激活显存几乎可以忽略。</p></li>
+<li><p><b>没有梯度同步</b>：训练里的数据并行需要在每步结束做梯度 all-reduce，通信量正比于参数量；ZeRO/FSDP 还要切分和收集优化器状态。<b>推理的"数据并行"退化成了纯粹的多副本（replica）部署，设备之间零通信</b>，只需要前面挂一个负载均衡器。这是推理最廉价、扩展性最好的一维并行。</p></li>
+<li><p><b>没有优化器状态</b>：训练中 Adam 的一阶、二阶动量加上 FP32 主权重，通常要占参数量的 12~16 倍字节数；推理只需要权重本身，而且可以激进量化到 FP8/INT4。</p></li>
+</ol>
+
+<div class="callout">
+<b>一句话总结</b>：训练的显存压力主要来自"优化器状态 + 激活"，推理的显存压力主要来自"权重 + KV Cache"。压力来源变了，切分策略自然就变了。
+</div>
+
+<h3>推理被劈成了两个性质完全不同的阶段</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这是推理独有的、也是最容易被忽视的一点。一次生成请求分为 prefill 和 decode 两个阶段，二者的性能特征几乎相反。
+</p>
+
+<p><b>Prefill（预填充 / 提示处理）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+一次性处理整个输入 prompt，序列长度 S 通常是几百到几十万。所有 token 可以并行计算，矩阵乘法是"胖"的 GEMM，算术强度（arithmetic intensity）高，<b>是计算受限（compute-bound）的</b>。它决定了 <b>TTFT（Time To First Token，首 token 延迟）</b>。
+</p>
+
+<p><b>Decode（解码 / 自回归生成）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+每步只处理 1 个新 token。此时 M 维退化为 batch size，GEMM 变成瘦长的 GEMV。以 batch=1 为例，读一遍 70B 模型的 FP16 权重要搬运 140 GB，而计算量只有 0.14 TFLOPs——在 H100 上访存需要约 42 ms，计算只需 0.14 ms，<b>访存受限（memory-bound）程度高达两个数量级</b>。它决定了 <b>TPOT（Time Per Output Token）/ ITL（Inter-Token Latency）</b>。
+</p>
+
+<pre class="codeblock">
+Prefill:  [t1 t2 t3 ... tS] ──→ 一次并行算完，GEMM 胖而高效
+                                算术强度高 → compute-bound
+                                关键指标：TTFT
+
+Decode:   [t_{S+1}] ──→ [t_{S+2}] ──→ [t_{S+3}] ──→ ...
+          每步只有 1 个 token，GEMM 退化为 GEMV
+          算术强度极低 → memory-bound
+          关键指标：TPOT / ITL
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+理解这一点极其重要，因为两个阶段的并行诉求是相反的：
+</p>
+
+<ul>
+<li><p><b>Prefill 阶段的并行策略应该按"训练思路"设计</b>——追求计算效率，可以用上下文并行切长序列。</p></li>
+<li><p><b>Decode 阶段的并行策略要按"降低访存与延迟"设计</b>——增大 batch 摊薄权重读取成本，通信要优化小消息延迟而非带宽。</p></li>
+</ul>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+诉求相反，于是催生了训练中完全不存在的一种并行形态：<b>PD 分离（Prefill-Decode Disaggregation）</b>——把 prefill 和 decode 部署在不同的设备池上，各自用最合适的并行配置和 batch 策略，中间通过高速网络传递 KV Cache。
+</p>
+
+<h3>KV Cache：推理并行的核心新约束</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+训练时用 teacher forcing 一次算完整个序列，不需要缓存。推理为了避免每生成一个 token 就重算一遍全部历史，必须缓存每层的 Key 和 Value。其大小为：
+</p>
+
+<div class="formula-box">
+KVCache = 2 × B × S × L × H_kv × d_head × bytes
+
+其中：2 表示 K 和 V；B 为并发请求数；S 为序列长度；
+      L 为层数；H_kv 为 KV 头数（GQA 下远小于 Q 头数）
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+举个具体例子，Llama-3-70B（80 层，GQA 8 个 KV 头，head_dim 128，FP16）：
+</p>
+
+<div class="formula-box">
+2 × 1 × 8192 × 80 × 8 × 128 × 2 B ≈ 2.68 GB / 请求
+
+→ 64 并发时 KV Cache 需要 171 GB
+→ 已经远超模型权重本身的 140 GB
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+如果没有 GQA（比如早期 MHA 模型有 64 个 KV 头），这个数字还要再乘 8。KV Cache 给并行设计带来三条硬约束：
+</p>
+
+<ol>
+<li><p><b>它是"每请求私有"的状态，不是可复制的权重</b>。权重可以随便复制，KV Cache 复制就是纯浪费显存。所以任何并行方案都必须回答"KV Cache 怎么切"。</p></li>
+<li><p><b>张量并行的切分被 KV 头数卡住</b>。TP 按注意力头切分时，KV Cache 天然按 H_kv 切开。但 Llama-3-70B 只有 8 个 KV 头，TP=8 时刚好每卡一个；要做 TP=16，就只能让两张卡各存一份相同的 KV 头（显存冗余翻倍），或者改用其他维度切分。<b>这是 GQA/MQA 时代 TP 扩展的真实上限</b>。</p></li>
+<li><p><b>它随时间增长，且长度不可预知</b>。训练的张量形状在编译期就固定了；推理中每个请求的 KV Cache 边生成边变长，还要支持请求随时加入和退出（continuous batching）。这意味着并行策略必须处理动态形状，每步的通信量都在变化，也很难像训练那样做静态的通信-计算调度编排。</p></li>
+</ol>
+
+<h3>优化目标从单目标变成多目标</h3>
+
+<table class="comparison">
+<tr><th>维度</th><th>训练</th><th>推理</th></tr>
+<tr><td>优化目标</td><td>吞吐（单一）</td><td>TTFT / TPOT / 吞吐 / 成本（多目标且冲突）</td></tr>
+<tr><td>约束形式</td><td>总时长预算</td><td>逐请求的 SLO（如 P99 TTFT &lt; 500 ms）</td></tr>
+<tr><td>负载特征</td><td>静态、同构、可预知</td><td>动态到达、长度异构、有突发</td></tr>
+<tr><td>批大小</td><td>固定，通常很大</td><td>动态，decode 阶段常常很小</td></tr>
+<tr><td>数值精度</td><td>受限于收敛性，一般 BF16/FP8</td><td>可激进量化到 FP8/INT4</td></tr>
+<tr><td>失败代价</td><td>回滚到 checkpoint</td><td>单请求失败，需在线容错</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+训练几乎总是选吞吐最优的并行配置；推理则要在 <b>延迟-吞吐的 Pareto 前沿</b> 上选点。同一个模型，做低延迟对话服务可能选 TP=8、小 batch；做离线批量总结可能选 TP=2 + 4 副本、超大 batch。二者的硬件利用率和成本可以差好几倍。
+</p>
+
+<h3>流水线并行的语义变了</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+训练中 PP 用 1F1B 调度，把 micro-batch 塞满流水线，气泡率大致是 (P-1)/(M+P-1)，其中 P 为 stage 数、M 为 micro-batch 数。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+推理的 decode 阶段每步只有"一个 token"，<b>天然没有 micro-batch 可以填充流水线</b>。如果朴素地做 PP，P 个 stage 里只有 1 个在工作，气泡率高达 (P-1)/P。可行的做法是靠 continuous batching 制造流水：把并发请求拆成多个 micro-batch，让不同请求占据不同 stage。代价是单请求的 ITL 变长（要串行穿过所有 stage）。
+</p>
+
+<div class="callout">
+推理中 PP 的定位是：<b>通信量极小</b>（只在 stage 边界传一个 activation 张量，点对点通信）、<b>适合跨节点</b>、<b>有利于吞吐但不利于延迟</b>。典型用法是"节点内 TP + 节点间 PP"。
+</div>
+
+<h3>小结：推理并行的选型直觉</h3>
+
+<ul>
+<li><p><b>DP（多副本）</b>：零通信，首选的扩容手段。只要单实例装得下模型，优先加副本。</p></li>
+<li><p><b>TP</b>：用于单卡装不下模型，或需要降低单请求延迟。必须在 NVLink 域内，规模受 KV 头数限制。</p></li>
+<li><p><b>PP</b>：用于跨节点装下超大模型，吞吐友好、延迟不友好。</p></li>
+<li><p><b>CP/SP（上下文并行）</b>：用于超长上下文，是唯一能线性扩展 KV Cache 容量的维度。</p></li>
+<li><p><b>EP（专家并行）</b>：MoE 模型专用，核心难题是负载均衡。</p></li>
+</ul>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.4.2 张量并行的通信优化</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>回顾：TP 在推理中的通信开销有多大</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+Megatron 式张量并行的标准切法是：MLP 的第一个权重按列切、第二个按行切，注意力按头切，每个 Transformer 层在前向中产生 <b>2 次 all-reduce</b>（一次在注意力后，一次在 MLP 后）。训练时前向反向合计 4 次，推理只有 2 次。
+</p>
+
+<div class="formula-box">
+单次 all-reduce 数据量 = B × S × d_model × bytes
+
+decode 阶段（S=1）、B=32、d_model=8192、FP16：
+    32 × 1 × 8192 × 2 = 512 KB    ← 非常小的消息
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+小消息 all-reduce 的耗时由 <b>延迟</b> 主导而非带宽。NVLink 上一次 NCCL all-reduce 的固定开销大约 10~30 μs，80 层 × 2 次 = 160 次，光通信固定开销就是 2~5 ms；而 70B 模型在 8 卡 TP 下一步 decode 的计算时间也就 5~10 ms。<b>通信占比轻松到 30%~50%。</b>
+</p>
+
+<div class="callout warn">
+如果 TP 跨节点（走 PCIe 或以太网），单次延迟从几十微秒变成几百微秒，通信直接吃掉一大半时间。<b>这就是"TP 不要跨节点"这条经验法则的量化依据。</b>
+</div>
+
+<h3>优化手段一：拓扑感知的进程放置</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+最基础也最有效的一条：<b>让 TP 组落在同一个 NVLink/NVSwitch 域内</b>。
+</p>
+
+<ul>
+<li><p>TP size ≤ 单节点 GPU 数（通常是 8）。</p></li>
+<li><p>跨节点的维度留给通信量小的 PP，或零通信的 DP。</p></li>
+<li><p>在 NVL72 这类超节点上，NVLink 域扩展到 72 卡，TP 的可行规模才有可能突破 8。</p></li>
+<li><p>具体到进程编号，要保证 TP rank 相邻（即 TP 是最内层维度），避免 rank 映射把一个 TP 组横跨两个 NUMA 或两台机器。</p></li>
+</ul>
+
+<h3>优化手段二：定制 All-Reduce Kernel</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+NCCL 的 Ring 算法对大消息是带宽最优的（每卡收发 2S(P-1)/P 字节），但对小消息，2(P-1) 步的串行跳数带来的延迟远大于传输时间。推理框架（vLLM、TensorRT-LLM、SGLang）因此都实现了自己的 custom all-reduce：
+</p>
+
+<table class="comparison">
+<tr><th>策略</th><th>做法</th><th>通信量</th><th>同步次数</th><th>适用消息大小</th></tr>
+<tr><td>One-shot</td><td>每卡把自己的数据经 NVLink P2P 直写到其他所有卡，各卡本地求和</td><td>每卡发 (P-1)S</td><td>1</td><td>极小（&lt; 1 MB）</td></tr>
+<tr><td>Two-shot</td><td>reduce-scatter + all-gather</td><td>每卡 2S(P-1)/P</td><td>2</td><td>中等（1~8 MB）</td></tr>
+<tr><td>NCCL Ring/Tree</td><td>标准集合通信库</td><td>带宽最优</td><td>多</td><td>大消息</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+实测在 8 卡 NVLink、消息小于 512 KB 时，one-shot 比 NCCL 快 2~3 倍。框架通常按消息大小自动选择策略。另有两个易被忽略但收益巨大的点：
+</p>
+
+<ul>
+<li><p><b>CUDA Graph</b>：decode 阶段的 kernel 又多又小，CPU 侧的 launch 开销（每个 kernel 5~10 μs）会成为瓶颈。把整个 decode step 用 CUDA Graph 捕获成一张图，一次提交，能消掉绝大部分 CPU 开销。注意 custom all-reduce 必须是 graph-capturable 的。</p></li>
+<li><p><b>Kernel 融合</b>：把 all-reduce 后紧跟的 residual add + RMSNorm 融进一个 kernel，减少一次全局显存往返。</p></li>
+</ul>
+
+<h3>优化手段三：序列并行与通信-计算重叠</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>序列并行（Sequence Parallel, SP）</b> 把 LayerNorm、Dropout 等"沿 hidden 维不可切但沿序列维可切"的算子也切开。此时 TP 层的一次 all-reduce 被拆成 <b>reduce-scatter + all-gather</b> 两个半程：
+</p>
+
+<pre class="codeblock">
+[SP 区: 序列切分] --all-gather--> [TP 区: 头/列切分] --reduce-scatter--> [SP 区]
+
+总通信量不变（all-reduce = RS + AG），但拆开后可以和 GEMM 重叠：
+
+  AllGather + GEMM 重叠：
+      收到第 k 块 → 立刻启动第 k 块的 GEMM
+
+  GEMM + ReduceScatter 重叠：
+      GEMM 沿输出 M 维分块，算完一块就发出去做 reduce-scatter
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+代表实现有 Megatron-LM 的 async tensor parallel、TransformerEngine 的 userbuffers（用 CUDA multicast 和 P2P 显存直写，绕开 NCCL），以及 FLUX 这类把通信直接融进 GEMM kernel 的工作。
+</p>
+
+<div class="callout warn">
+这类重叠在 <b>prefill 阶段收益显著</b>（GEMM 大，足够掩盖通信），在 <b>decode 阶段收益有限</b>——GEMM 本身就只有几十微秒，切块后每块的计算时间盖不住通信启动开销。Decode 阶段更依赖前面说的低延迟 all-reduce kernel。
+</div>
+
+<h3>优化手段四：通信量化</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+既然 decode 是访存/通信受限，那把通信本身的数据量压下来就是直接收益：FP8 通信可将通信量减半，INT8/INT4 更激进，但通常需要 per-token 或 per-channel 的 scale。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+关键工程细节是：<b>求和必须在高精度下做</b>。常见做法是"低精度传输 + 高精度累加"——reduce-scatter 阶段传 FP8，本地反量化成 FP32 累加，再量化成 FP8 做 all-gather。
+</p>
+
+<div class="callout negative">
+如果直接在低精度下累加，P 路误差会随 TP size 增长而放大，并在长序列生成中逐 token 累积，可能导致输出崩坏。<b>上线前务必做长文本的端到端质量回归</b>，只测短 prompt 是发现不了这个问题的。
+</div>
+
+<h3>优化手段五：规避 KV 头数限制</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+前面提到 GQA 模型的 H_kv 可能小于 TP size。几种处理方式：
+</p>
+
+<table class="comparison">
+<tr><th>方案</th><th>做法</th><th>代价</th></tr>
+<tr><td>KV 头复制</td><td>多张卡持有相同的 KV 头</td><td>KV Cache 显存冗余 ×(P/H_kv)</td></tr>
+<tr><td>按 head_dim 切</td><td>在头内部切分 d_head</td><td>需要额外通信合并注意力结果</td></tr>
+<tr><td>降低 TP，配合 CP</td><td>TP 只到 H_kv，剩余并行度给上下文并行</td><td>实现复杂度上升</td></tr>
+<tr><td>DP Attention</td><td>注意力部分用数据并行（各卡持有不同请求的完整 KV），MLP 部分用 TP</td><td>两部分之间需 all-gather / reduce-scatter，但 KV Cache 零冗余</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+最后一种（DeepSeek 系模型和 SGLang 采用的 <b>DP Attention</b>）在 MLA/GQA 且 KV 头很少的模型上尤其有效，值得重点关注。
+</p>
+
+<h3>TP 的收益上限</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+随着 TP size 增大，单卡计算量按 1/P 下降，但通信的 <b>固定延迟不随 P 下降</b>（甚至因跳数增加而上升）。于是 decode 延迟大致是：
+</p>
+
+<div class="formula-box">
+T(P) ≈ T_compute / P  +  α × L × 2  +  β × Bytes / P
+                          ↑
+                    与 P 无关的常数项
+                （α 为单次通信固定延迟，L 为层数）
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+第二项是常数，导致 P 增大到一定程度后曲线变平，再往上甚至因为 kernel 效率下降（GEMM 的 N 维太小）而反弹。<b>实践中稠密模型的 TP 甜点通常在 4~8</b>，超过之后应该考虑加副本（DP）而不是继续加 TP。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.4.3 上下文并行与长文本推理（Ring Attention）</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>为什么需要沿序列维切分</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+当上下文长度从 8K 涨到 128K 甚至 1M 时，两个问题同时爆发：
+</p>
+
+<ol>
+<li><p><b>KV Cache 爆炸</b>：前面算过，Llama-3-70B 在 8K 上下文时单请求 KV Cache 是 2.68 GB；到 128K 就是 <b>43 GB</b>，一张 H100（80 GB）扣掉权重后连一个请求都放不下。</p></li>
+<li><p><b>注意力计算量爆炸</b>：Attention 的 FLOPs 是 O(S²)，而 FFN 是 O(S)。在 8K 时注意力只占总计算的百分之十几；到 128K 时注意力反过来占了绝大部分。</p></li>
+</ol>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+TP 无法解决这个问题：它的切分粒度是注意力头，而头数是固定的（GQA 下只有 8 个）。<b>唯一能随序列长度线性扩展的维度，是序列维本身</b>。这就是上下文并行（Context Parallel, CP）。
+</p>
+
+<h3>Ring Attention 的原理</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+设有 P 个设备、序列长度 S。把序列切成 P 段，设备 i 持有 Q_i、K_i、V_i（各 S/P 个 token）。问题在于注意力要求每个 Query 看到 <b>所有</b> 的 Key/Value，而 KV 分散在各设备上。Ring Attention 的解法是让 KV 块 <b>在环上转圈</b>：
+</p>
+
+<pre class="codeblock">
+        ┌─────→ Dev0 ─────→ Dev1 ─────→ Dev2 ─────→ Dev3 ─────┐
+        └───────────────────────────────────────────────────────┘
+                        （KV 块环形传递）
+
+第 0 步:  设备 i 用 (Q_i, K_i, V_i) 算局部注意力，
+          同时把 K_i, V_i 发给设备 i+1
+第 1 步:  设备 i 用 (Q_i, K_{i-1}, V_{i-1}) 算，同时转发 KV
+   ...
+第 P-1 步: 每个设备的 Q_i 已经见过全部 P 份 KV
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+结果的正确性靠 <b>online softmax</b>（FlashAttention 的核心技巧）保证：每个设备维护三个 running 状态——行最大值 m、指数和 ℓ、加权输出累加 O。收到新的 KV 块并算出局部结果 (m', ℓ', O') 后按下式合并：
+</p>
+
+<div class="formula-box">
+m_new = max(m, m')
+
+ℓ_new = exp(m - m_new) · ℓ  +  exp(m' - m_new) · ℓ'
+
+O_new = [ exp(m - m_new) · ℓ · O  +  exp(m' - m_new) · ℓ' · O' ] / ℓ_new
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这样就 <b>无需在任何时刻物化完整的 S × S 注意力矩阵</b>，也无需任何设备持有全量 KV。
+</p>
+
+<h3>通信能被隐藏吗？</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+Ring Attention 的精妙之处在于：<b>第 t 步的 KV 传输，可以和第 t-1 步的注意力计算重叠</b>（用双缓冲 + 异步 P2P send/recv）。
+</p>
+
+<div class="formula-box">
+每步通信量 = 2 × (S/P) × H_kv × d_head × bytes    ← 与 S 线性
+每步计算量 = O( (S/P)² )                          ← 与 S 平方
+
+隐藏条件（简化）：
+    2·(S/P)²·H_q·d_head·2 / FLOPS  ≥  2·(S/P)·H_kv·d_head·bytes / BW
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+所以 <b>序列越长，计算越容易掩盖通信</b>。化简后可以得到一个对 S/P 的下界：每个设备分到的 token 数不能太少。这条约束在实践中意味着 CP 的并行度不是越大越好——切得太碎，单块计算时间盖不住 KV 传输。
+</p>
+
+<h3>因果掩码带来的负载不均衡（以及怎么修）</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这是 Ring Attention 最重要的工程陷阱。因果掩码下，持有序列后段的设备要 attend 前面所有 token，持有前段的设备只需要 attend 自己那一小段。
+</p>
+
+<div class="callout negative">
+<b>朴素连续切分下，设备 0 的计算量接近 0，设备 P-1 的计算量接近 P 倍平均值。</b>而每步都要同步等待最慢的设备——整体效率只有理想值的一半左右。
+</div>
+
+<p><b>方案一：Zigzag / 对折切分</b>（Megatron-LM 的 CP、ring-flash-attention 采用）</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+把序列切成 2P 块，设备 i 拿第 i 块和第 (2P-1-i) 块，让靠前的"轻"块和靠后的"重"块配对：
+</p>
+
+<pre class="codeblock">
+P = 4，序列切成 8 块（块号越大，因果计算量越大）：
+
+  设备 0: 块 0  +  块 7      ← 最轻 + 最重
+  设备 1: 块 1  +  块 6
+  设备 2: 块 2  +  块 5
+  设备 3: 块 3  +  块 4
+
+→ 每个设备的总计算量近似相等
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+实现简单、均衡效果好，是目前最常用的做法。
+</p>
+
+<p><b>方案二：Striped Attention（条纹切分）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+按 stride 交错分配：设备 i 拿 token i, i+P, i+2P, …。这样每个设备持有的 token 在序列中均匀分布，因果计算量天然均衡。代价是块内的因果掩码不再是标准的下三角，需要修改 kernel 处理"偏移一格"的掩码。
+</p>
+
+<h3>关键区分：Prefill 用 Ring，Decode 不用 Ring</h3>
+
+<div class="callout warn">
+这是很多资料讲不清楚的地方，也是推理侧 CP 与训练侧 CP 的最大差异。
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>Prefill 阶段</b>：query 有 S 个，KV 也有 S 个。Ring Attention 完全适用，把长 prompt 切开并行处理，能显著降低 TTFT。这是 CP 在推理中的主战场。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>Decode 阶段</b>：query <b>只有 1 个 token</b>，而 KV Cache 有 S 个且分散在 P 个设备上。此时如果还转 KV，就等于把几十 GB 的 cache 在环上搬一圈——荒谬。正确的做法是 <b>方向反过来</b>：
+</p>
+
+<pre class="codeblock">
+Decode 阶段的正确做法（Flash-Decoding 的跨设备版本）：
+
+  1. 把这 1 个 token 的 Q 广播给所有设备
+     （数据量极小：B × H_q × d_head）
+
+  2. 每个设备用全局 Q 对【本地那 1/P 份 KV Cache】算局部注意力，
+     输出 (O_i, m_i, ℓ_i)
+
+  3. 一次 all-gather / all-reduce，
+     用 online softmax 合并公式归约出最终结果
+
+  → 通信量 O(B × H_q × d_head)，与序列长度 S 无关
+</pre>
+
+<table class="comparison">
+<tr><th></th><th>Prefill</th><th>Decode</th></tr>
+<tr><td>移动的对象</td><td>KV 块（环形传递）</td><td>Q 和局部结果</td></tr>
+<tr><td>通信量</td><td>O(S/P) 每步，共 P-1 步</td><td>O(1)，与 S 无关</td></tr>
+<tr><td>掩盖方式</td><td>与本块注意力计算重叠</td><td>通信量本身就极小</td></tr>
+<tr><td>主要收益</td><td>降低 TTFT、装下超长 prompt</td><td>装下超大 KV Cache、加速长上下文 decode</td></tr>
+</table>
+
+<h3>与其他并行维度的组合</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+CP 与 TP <b>正交</b>：可以先 TP 切头，再 CP 切序列，总并行度 P_TP × P_CP。一个 128K 上下文的 70B 模型典型配置可能是 TP=8 × CP=2，共 16 卡。组合时需要注意：
+</p>
+
+<ul>
+<li><p>CP 组内的 P2P 通信量随序列长度增长，<b>优先放在 NVLink 域内</b>；若必须跨节点，要确保 InfiniBand/RoCE 带宽充足，并核算前面那条掩盖条件。</p></li>
+<li><p>CP 让每卡只存 1/P 的 KV Cache，和 PagedAttention 的分页管理是互补的：前者解决"跨设备的容量扩展"，后者解决"单设备内的碎片与共享"。</p></li>
+<li><p>CP 与 <b>chunked prefill</b> 结合时，要注意 chunk 边界与 CP 切分边界的对齐，否则会产生额外的重排通信。</p></li>
+</ul>
+
+<!-- ════════════════════════════════════════ -->
+<h2>7.4.4 MoE 推理中的专家并行负载均衡</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>专家并行的基本机制与推理中的特殊性</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+MoE 层里有 E 个专家，router 为每个 token 选出 top-k 个。专家并行（Expert Parallel, EP）把 E 个专家分散到 P 个设备，每设备持有 E/P 个：
+</p>
+
+<pre class="codeblock">
+Router 打分
+    ↓
+All-to-All (dispatch)  ← 把 token 发到目标专家所在设备
+    ↓
+本地专家 GEMM
+    ↓
+All-to-All (combine)   ← 把结果送回原设备
+    ↓
+按 gate 权重加权求和
+</pre>
+
+<p><b>特性一："总参数大、激活参数小"的错配</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+以 DeepSeek-V3 这类模型为例，总参数量数千亿但每 token 只激活其中几十分之一。Decode 阶段是访存受限，理论上访存量只对应激活参数——<b>但前提是权重能放得下</b>。放得下就必须把总权重铺开到很多卡，于是 EP 度往往被"显存容量"而非"计算需求"推到几十上百。
+</p>
+
+<p><b>特性二：单专家的 batch 太小，GEMM 效率崩塌</b></p>
+
+<div class="formula-box">
+平均每专家收到的 token 数：  t̄ = T · k / E
+
+decode 阶段 T 就等于并发数。若 T=64、k=8、E=256：
+    t̄ = 64 × 8 / 256 = 2 个 token   ← tensor core 基本空转
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>所以 MoE 推理天然需要大 batch</b>，这也是为什么 MoE 服务通常要配合更激进的 continuous batching 和更大的并发目标。
+</p>
+
+<h3>负载不均衡：为什么推理比训练严重</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+训练时有辅助负载均衡损失（auxiliary loss）或 loss-free 的 bias 调整机制，持续把 router 分布往均匀推。推理时 <b>没有任何训练信号</b>，不均衡的来源有三：
+</p>
+
+<ol>
+<li><p><b>分布漂移</b>：线上流量分布（语言、领域、格式）与训练语料不同，某些专家会系统性地热门。比如代码请求和中文对话激活的专家集合可能差异很大。</p></li>
+<li><p><b>小数定律</b>：即使期望是均匀的，decode 阶段每步只有几十上百个 token，采样方差极大。T·k = 512 个 token 分给 256 个专家，即使完全随机，最热专家的负载也会远超均值。</p></li>
+<li><p><b>All-to-All 是同步屏障</b>：所有设备必须等最慢的那个算完才能进入 combine。<b>整层耗时由最大负载决定，而非平均负载。</b></p></li>
+</ol>
+
+<div class="formula-box">
+不均衡度 Imbalance = max_i(t_i) / t̄
+
+实测中 decode 阶段常达到 2~5
+→ 意味着一半以上的 MoE 算力被浪费在等待上
+</div>
+
+<div class="callout negative">
+这是 MoE 推理最主要的效率杀手。端到端延迟只会告诉你"慢了"，不会告诉你是"某个专家过热"——没有专门的负载统计，这类问题几乎无法定位。
+</div>
+
+<h3>均衡手段</h3>
+
+<p><b>（1）冗余专家 / 专家副本（Redundant Experts）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+把统计上最热的若干专家在多个设备上各放一份，路由时在副本之间按当前负载分流。DeepSeek 公开的部署方案里就用了这一手，配套的 <b>EPLB（Expert Parallel Load Balancer）</b> 会周期性地根据统计热度重新计算专家到设备的放置方案。优点是直接有效，代价是额外显存以及需要在线负载统计。
+</p>
+
+<p><b>（2）专家重排 / 分组放置</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+不复制，只是 <b>换个放法</b>。根据统计的专家热度，把"热专家"和"冷专家"搭配放在同一设备上，让各设备的期望负载和方差都尽量小。这本质是一个装箱问题；如果进一步考虑专家的 <b>共激活关系</b>（哪些专家常被同一 token 同时选中），还可以建模成图划分问题，顺带减少跨节点流量。
+</p>
+
+<p><b>（3）动态迁移</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+流量特征会随时间变化（白天 vs 夜间、不同业务接入）。可以用滑动窗口统计热度，当不均衡度超过阈值时触发专家权重的重新放置。因为搬运权重的代价在百毫秒到秒级，这个动作必须 <b>低频执行</b>（分钟级），并且要做好迁移期间的请求路由过渡。
+</p>
+
+<p><b>（4）不丢 token（Dropless）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+训练中常用 capacity factor 限制每个专家的 token 上限，超出的直接丢弃，好处是张量形状固定。<b>推理不能这么做</b>——丢 token 会直接损害生成质量，而且用户能感知。因此推理必须走 dropless 路线，用变长的 Grouped GEMM / 块稀疏 GEMM（如 MegaBlocks 的实现）处理不等长的专家输入。这也是为什么 MoE 推理 kernel 比训练更难写。
+</p>
+
+<p><b>（5）双批次重叠（Two-Batch Overlap）</b></p>
+
+<pre class="codeblock">
+把一个 batch 拆成两个 micro-batch 交错执行：
+
+  时间 →
+  micro-batch A:  [计算]──[All-to-All]──[计算]──[All-to-All]
+  micro-batch B:  [A2A]───[计算]───────[A2A]───[计算]
+                    ↑ 一个通信时另一个计算，All-to-All 被隐藏
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这是 DeepSeek DualPipe 思想在推理侧的对应物，SGLang 等框架已有实现。收益在跨节点 EP 场景下尤其明显。
+</p>
+
+<p><b>（6）限制路由范围（Node-Limited Routing）</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+从 <b>模型设计层面</b> 约束通信：限制每个 token 最多被路由到 M 个节点（而不是任意 E 个专家所在的任意节点）。这样 all-to-all 的跨节点流量有了硬上界，可以按"节点内 NVLink + 节点间 IB"的带宽比来设定 M。DeepSeek-V3 采用了这一设计，是"算法-系统协同设计"的典型例子。
+</p>
+
+<h3>EP 与 TP 的取舍</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+MoE 层既可以用 EP 切，也可以用 TP 切（切每个专家内部的权重矩阵）：
+</p>
+
+<table class="comparison">
+<tr><th>维度</th><th>EP（切专家）</th><th>TP（切专家内部）</th></tr>
+<tr><td>通信原语</td><td>All-to-All ×2</td><td>All-Reduce ×1</td></tr>
+<tr><td>通信量</td><td>∝ T · k · d_model</td><td>∝ T · d_model</td></tr>
+<tr><td>权重分布</td><td>每卡持有完整的若干专家</td><td>每卡持有所有专家的一部分</td></tr>
+<tr><td>单卡 GEMM 形状</td><td>瘦（token 少），但 N 维完整</td><td>N 维被切小，token 全量</td></tr>
+<tr><td>负载均衡</td><td><b>是核心难题</b></td><td>天然均衡</td></tr>
+<tr><td>对拓扑敏感度</td><td>All-to-All 对跨节点极敏感</td><td>All-Reduce 相对友好</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+实践上常见的组合是：<b>节点内用 TP、节点间用 EP</b>，或者在超大模型上直接铺开大规模 EP（数十到数百路），把 attention 部分用 DP Attention 处理。
+</p>
+
+<h3>Prefill 与 Decode 应该用不同的 EP 配置</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+回到 7.4.1 的主线：两个阶段的诉求不同，在 MoE 上体现得尤其明显。
+</p>
+
+<table class="comparison">
+<tr><th>维度</th><th>Prefill</th><th>Decode</th></tr>
+<tr><td>每步 token 数</td><td>很多（整个 prompt）</td><td>很少（等于并发数）</td></tr>
+<tr><td>天然均衡度</td><td>好（大样本，方差小）</td><td>差（小样本，方差大）</td></tr>
+<tr><td>主要瓶颈</td><td>专家 GEMM 的计算量</td><td>权重访存 + All-to-All 延迟 + 等待最慢专家</td></tr>
+<tr><td>建议 EP 度</td><td>相对小，够放下权重即可</td><td>更大，配合冗余专家和大 batch</td></tr>
+</table>
+
+<div class="callout">
+这也是 PD 分离在 MoE 模型上收益比稠密模型更大的原因之一：两个阶段可以各自选择最优的 EP 规模、冗余专家数量和 batch 策略，互不掣肘。
+</div>
+
+<h3>上线必须监控的指标</h3>
+
+<ul>
+<li><p><b>每设备的专家 token 数分布</b>：计算 max/mean 不均衡度，做时序告警</p></li>
+<li><p><b>All-to-All 的实际耗时占比</b>，以及各 rank 的等待时间方差</p></li>
+<li><p><b>Top-N 热点专家列表</b> 及其随时间的漂移（用于触发重排 / 迁移）</p></li>
+<li><p><b>有效 batch</b>：每专家平均 token 数 t̄，低于阈值说明并发不足，GEMM 在空转</p></li>
+</ul>
+
+<!-- ════════════════════════════════════════ -->
+<h2>本节小结</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+推理并行与训练并行的分野，根源在三件事：<b>没有反向传播</b>（去掉了梯度同步和激活存储）、<b>多了 KV Cache</b>（引入了随请求增长的私有状态）、<b>分裂成计算受限的 prefill 和访存受限的 decode</b>（两个阶段诉求相反）。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+由此推出的工程结论是：
+</p>
+
+<ul>
+<li><p><b>DP</b> 在推理里是零通信的，优先用它扩容</p></li>
+<li><p><b>TP</b> 受 NVLink 域和 KV 头数双重约束，甜点在 4~8，核心优化是<b>小消息延迟</b>（custom all-reduce + CUDA Graph）而非带宽</p></li>
+<li><p><b>CP</b> 是长上下文的唯一线性扩展维度，<b>prefill 转 KV（Ring）、decode 转 Q（Flash-Decoding 式归约）</b>，方向相反，且必须处理因果掩码的负载不均</p></li>
+<li><p><b>EP</b> 的核心矛盾是负载均衡，手段是冗余专家、重排、大 batch 和通信重叠，并且 prefill / decode 应当分别配置</p></li>
+</ul>
+
+<div class="callout">
+一个贯穿全节的判断依据：<b>先算清楚通信是被延迟主导还是被带宽主导</b>。Decode 阶段的小消息由延迟主导，优化方向是减少同步次数和降低单次开销；Prefill 阶段的大消息由带宽主导，优化方向是重叠和量化。用错方向的优化，往往一分钱收益都拿不到。
+</div>
+
+</div>
+
+<div id="footer">
+<div id="footer-text"></div>
+</div>
+
+<p><center>
+&copy; Xiaoyi | <a href="index.html">Homepage</a>
+</center></p>
+
+</body>
+</html>

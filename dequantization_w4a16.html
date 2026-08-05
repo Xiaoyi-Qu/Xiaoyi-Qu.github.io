@@ -458,7 +458,7 @@ AI(M) = 2MNK / [2MK + b_w &middot; KN + 2MN]
 容差设为 <code>atol=2e-2</code> 而非机器精度，原因有二：参考路径在 FP16 下做累加（<code>torch.matmul</code> 的 FP16 GEMM 内部虽用 FP32 累加，但反量化本身经过了 FP16 舍入），而 kernel 路径的反量化在 <code>(q - z)</code> 转 FP16 后与 <code>s</code> 相乘，两条路径的舍入位置不同；K=4096 的长累加会把这些微小差异放大。若想收紧对拍，可以让参考路径也严格模拟 kernel 的舍入顺序。
 </p>
 
-<h3>第四步：验证 8.6.2 的预言</h3>
+<h3>第四步：验证 2.1.2 的预言</h3>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
 最后用一个简单的基准测试，观察加速比随 M 的变化：

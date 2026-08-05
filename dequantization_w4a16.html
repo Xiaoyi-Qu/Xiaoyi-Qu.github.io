@@ -81,19 +81,18 @@ table.comparison td {
 </div>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-上一节我们讨论了权重量化的离线过程：如何把 FP16 权重压缩成 INT4 并保存 scale、zero-point 等量化元数据。本节关注的是硬币的另一面——<b>推理时如何高效地使用这些 INT4 权重</b>。
+    权重量化通常分为两个阶段：离线阶段把 FP16 权重压缩成 INT4，并保存 scale、zero-point 等量化元数据；本节关注的是另一阶段：<b>推理时如何高效地使用这些 INT4 权重</b>。</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+所谓 W4A16，指的是权重（Weight）以 4-bit 整数存储，而激活值（Activation）仍保持 16-bit 浮点（FP16/BF16）的推理方案。这是 GPTQ、AWQ 等主流权重量化方法在部署时的标准形态。它的核心矛盾在于：<b>现代 GPU 的 Tensor Core 并不存在 "INT4 &times; FP16" 这样的混合精度乘法指令</b>。INT4 权重在参与矩阵乘之前，必须先被"反量化"（dequantize）回 FP16。问题是这一步反量化应该发生在哪里？做得不好，量化带来的全部带宽收益会被瞬间抹平；做得好，则能让解码阶段的矩阵乘获得接近 4 倍的加速。
 </p>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-所谓 W4A16，指的是权重（Weight）以 4-bit 整数存储，而激活值（Activation）仍保持 16-bit 浮点（FP16/BF16）的推理方案。这是 GPTQ、AWQ 等主流权重量化方法在部署时的标准形态。它的核心矛盾在于：<b>现代 GPU 的 Tensor Core 并不存在 "INT4 &times; FP16" 这样的混合精度乘法指令</b>。INT4 权重在参与矩阵乘之前，必须先被"反量化"（dequantize）回 FP16。问题是——这一步反量化应该发生在哪里？做得不好，量化带来的全部带宽收益会被瞬间抹平；做得好，则能让解码阶段的矩阵乘获得接近 4 倍的加速。
-</p>
-
-<p style="text-align:justify; text-justify:inter-ideograph;">
-本节先从数据流的角度分析"片上反量化 + GEMM 融合"这一关键设计（8.6.1），再用 Roofline 模型解释 W4A16 为什么在小 batch 下收益巨大、在大 batch 下反而可能变慢（8.6.2），最后动手实现一个完整的 W4A16 反量化矩阵乘 Triton kernel，并与 PyTorch 参考实现对拍验证（8.6.3）。
+本节先从数据流的角度分析"片上反量化 + GEMM 融合"这一关键设计（2.1.1），再用 Roofline 模型解释 W4A16 为什么在小 batch 下收益巨大、在大 batch 下反而可能变慢（2.1.2），最后动手实现一个完整的 W4A16 反量化矩阵乘 Triton kernel，并与 PyTorch 参考实现对拍验证（2.1.3）。
 </p>
 
 <!-- ════════════════════════════════════════ -->
-<h2>8.6.1 片上反量化与 GEMM 的融合</h2>
+<h2>2.1.1 片上反量化与 GEMM 的融合</h2>
 <!-- ════════════════════════════════════════ -->
 
 <h3>朴素方案的陷阱：先反量化，再做 GEMM</h3>
@@ -104,46 +103,50 @@ table.comparison td {
 
 <pre class="codeblock">
 方案 A（朴素两段式）:
-  Step 1: dequant_kernel   —— 读取 INT4 权重 + scale/zero，写出完整的 FP16 权重矩阵到显存
-  Step 2: cublas_gemm      —— 用 cuBLAS 对 FP16 激活 × FP16 权重 做标准矩阵乘
+  Step 1: dequant_kernel   读取 INT4 权重 + scale/zero，写出完整的 FP16 权重矩阵到显存
+  Step 2: cublas_gemm      用 cuBLAS 对 FP16 激活 × FP16 权重 做标准矩阵乘
 </pre>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-这个方案功能上完全正确，但从访存角度看是一场灾难。以一个 <code>K=4096, N=4096</code> 的权重矩阵为例：
+这个方案功能上完全正确，但从访存角度看是一场灾难。以一个 <code>(K,N)=(4096, 4096)</code> 的权重矩阵为例：
 </p>
 
 <ul>
-<li><p>Step 1 需要从 HBM 读入约 8 MB 的 INT4 权重（4096&times;4096&times;0.5 字节），再向 HBM <b>写出 32 MB</b> 的 FP16 权重；</p></li>
-<li><p>Step 2 又要把这 32 MB 的 FP16 权重<b>重新从 HBM 读回来</b>。</p></li>
+<li><p><b>Step 1（反量化 kernel）</b>：从 HBM 读入约 8 MB 的 INT4 权重 <code>((4096&times;4096&times;0.5)/(1024&times;1024)=8MB)</code>，在 L2/寄存器中完成解包并乘上 scale，再把结果写出 32 MB的FP16权重到 HBM。注意这里必须另开一块显存，而不是原地覆盖。</p></li>
+<li><p><b>Step 2（GEMM）</b>：cuBLAS 之类的 kernel 再把这 32 MB 的 FP16 权重重新从 HBM 读回来。</p></li>
 </ul>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-一来一回，权重相关的 HBM 流量是 8 + 32 + 32 = 72 MB，反而比直接用 FP16 权重（32 MB）多了一倍以上。此外还需要额外分配一块 FP16 权重的临时显存。量化省下的存储空间和带宽，在推理路径上被完全浪费了——INT4 只剩下"模型文件更小、加载更快"这一点好处。
+从访存流量上讲，一来一回，权重相关的 HBM 流量是 8MB（读 INT4）+ 32MB（写 FP16）+ 32MB（读 FP16）= 72 MB，反而比直接用 FP16 权重（32 MB）多了一倍以上。显存占用上，INT4 权重通常要在整个推理期间常驻（下一次 forward 还要用），因此 8 MB 的 INT4 与 32 MB 的 FP16 临时 buffer 同时存在，峰值 40 MB，比纯 FP16 方案的 32 MB 还要多。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+量化省下的存储空间和带宽，在推理路径上被完全浪费了。INT4 的紧凑表示只在 HBM&rarr;SM 的那 8 MB 一跳上发挥了作用，紧接着就被还原成 FP16 送回 HBM，后面的 GEMM 面对的完全是一个 FP16 问题。最终 INT4 只剩下"模型文件更小、加载更快"这一点好处。
 </p>
 
 <div class="callout negative">
-<b>方案 A 的致命问题</b>：反量化后的 FP16 权重落回 HBM，然后 GEMM 又要重新读取。权重相关的 HBM 流量（72 MB）反而是直接用 FP16 权重（32 MB）的两倍多——量化的带宽收益被完全浪费。
+<b>朴素两段式方案的致命问题</b>：反量化后的 FP16 权重落回 HBM，然后 GEMM 又要重新读取。权重相关的 HBM 流量（8 + 32 + 32 = 72 MB）是直接用 FP16 权重（32 MB）的两倍多，峰值显存（40 MB）同样更高，量化在带宽和容量两个维度上的收益都被完全浪费。
 </div>
 
 <h3>融合方案：让反量化只发生在片上</h3>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-正确的做法是把反量化<b>融合进 GEMM kernel 内部</b>，让 FP16 形态的权重只存在于 GPU 的片上存储（寄存器 / shared memory）中，从始至终不落回 HBM：
+正确的做法是把反量化<b>融合进 GEMM kernel 内部</b>，让 FP16 形态的权重只存在于GPU的片中，从始至终不落回HBM：
 </p>
 
 <pre class="codeblock">
 方案 B（融合式，W4A16 的标准做法）:
 
-  HBM ──(INT4 packed 权重, 0.5 B/元素)──▶ 寄存器/Shared Memory
-                                              │
-                                        片上反量化
-                                    w = (q - zero) * scale
-                                              │
-                                              ▼
-  HBM ──(FP16 激活)──────────────────▶  tl.dot / Tensor Core (FP16 × FP16)
-                                              │
-                                              ▼
-                                        FP16 结果写回 HBM
+  HBM ───── INT4 packed 权重, 0.5bytes/元素 ──▶ Register/Shared Memory
+                                                        │
+                                                    片上反量化
+                                                w = (q - zero) * scale
+                                                        │
+                                                        ▼
+  HBM ───── FP16 激活值 ─────────────────────▶ tl.dot / Tensor Core (FP16 × FP16)
+                                                        │
+                                                        ▼
+                                                FP16 结果写回 HBM
 </pre>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
@@ -151,7 +154,7 @@ table.comparison td {
 </p>
 
 <ol>
-<li><p>从 HBM 加载一小块<b>打包的 INT4 权重</b>（通常 8 个 4-bit 值打包进一个 <code>int32</code>）；</p></li>
+<li><p>从 HBM 加载一小块打包的 INT4 权重（通常 8 个 4-bit 值打包进一个 <code>int32</code>）；</p></li>
 <li><p>在寄存器中用移位和按位与指令把 4-bit 数解包出来；</p></li>
 <li><p>加载对应分组（group）的 <code>scale</code> 和 <code>zero</code>，在片上完成 <code>w = (q - zero) &times; scale</code>；</p></li>
 <li><p>把反量化得到的 FP16 小块直接喂给 <code>tl.dot</code>（底层映射到 Tensor Core 的 MMA 指令）；</p></li>
@@ -159,7 +162,7 @@ table.comparison td {
 </ol>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-这样一来，权重在 HBM 侧的流量就只有 INT4 本身（外加占比很小的 scale/zero 元数据），相比 FP16 GEMM 减少到约 1/4。<b>反量化的计算成本（移位、减法、乘法）被"藏"进了原本就在等待访存的空闲计算周期里</b>——这正是访存受限 kernel 融合的经典收益模式，与第 7 章讨论的逐元素算子融合一脉相承。
+这样一来，权重在 HBM 侧的流量就只有 INT4 本身（外加占比很小的 scale/zero 元数据），相比 FP16 GEMM 减少到约 1/4。<b>反量化的计算成本（移位、减法、乘法）被"藏"进了原本就在等待访存的空闲计算周期里</b>——这正是访存受限 kernel 融合的经典收益模式。
 </p>
 
 <h3>融合 kernel 需要处理的三个工程细节</h3>
@@ -173,23 +176,23 @@ q[k, n] = (packed[k // 8, n] &gt;&gt; ((k % 8) * 4)) &amp; 0xF
 </pre>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-生产级实现（如 Marlin、ExLlamaV2）会进一步设计更复杂的交织（interleaved）布局，让解包出来的数据恰好符合 Tensor Core MMA 指令要求的寄存器排布，省掉片上的重排开销。本章的教学实现采用上面这种最直观的顺序布局。
+生产级实现（如 Marlin、ExLlamaV2）会进一步设计更复杂的交织布局（interleaved layout），让解包出来的数据恰好符合 Tensor Core MMA 指令要求的寄存器排布，省掉片上的重排开销。本章的教学实现采用上面这种最直观的顺序布局。
 </p>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-<b>（2）分组量化元数据的读取。</b> 第 8.2 节介绍过，为了控制量化误差，W4 通常按 <code>group_size = 128</code> 沿 K 维分组，每组独立拥有一对 <code>(scale, zero)</code>。融合 kernel 在处理第 <code>k</code> 行权重时需要索引到第 <code>k // group_size</code> 组的元数据。元数据本身很小（每 128 个权重共享 2 个标量），带宽占比不足 3%，但要注意让 <code>BLOCK_K</code> 与 <code>group_size</code> 对齐（例如 <code>BLOCK_K = 64</code>、<code>group_size = 128</code>），避免一个 K 分块横跨两个 group 导致的分支处理。
+<b>（2）分组量化元数据的读取。</b> 为了控制量化误差，W4 通常按 <code>group_size = 128</code> 沿 K 维分组，每组独立拥有一对 <code>(scale, zero)</code>。融合 kernel 在处理第 <code>k</code> 行权重时需要索引到第 <code>k // group_size</code> 组的元数据。元数据本身很小（每 128 个权重共享 2 个标量），但要注意让 <code>BLOCK_K</code> 与 <code>group_size</code> 对齐（例如 <code>BLOCK_K = 64</code>、<code>group_size = 128</code>），避免一个 K 分块横跨两个 group 导致的分支处理。
 </p>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-<b>（3）反量化指令与 MMA 的流水重叠。</b> 解包用的是 INT32 ALU，矩阵乘用的是 Tensor Core，二者是 SM 上不同的执行单元。写得好的 kernel 会让"下一块权重的加载与解包"和"当前块的 MMA 计算"重叠起来（软件流水 / double buffering）。在 Triton 中，编译器的自动流水（<code>num_stages</code>）通常能帮我们完成大部分工作；而在 CUDA 手写实现中，这是 Marlin 这类 kernel 性能领先的关键所在。
+<b>（3）反量化指令与 MMA 的流水重叠。</b> 解包用的是 INT32 ALU，矩阵乘用的是 Tensor Core，二者是 SM 上不同的执行单元。写得好的 kernel 会让"下一块权重的加载与解包"和"当前块的 MMA 计算"重叠起来。在 Triton 中，编译器的自动流水通常能帮我们完成大部分工作。
 </p>
 
 <!-- ════════════════════════════════════════ -->
-<h2>8.6.2 从 I/O 受限到计算受限的转变</h2>
+<h2>2.1.2 从 I/O 受限到计算受限的转变</h2>
 <!-- ════════════════════════════════════════ -->
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-W4A16 的收益并非无条件成立。用第 2 章的 Roofline 模型可以精确刻画它的适用边界，结论是：<b>W4A16 是为访存受限（memory-bound）场景设计的技术；随着 batch 增大、GEMM 逐渐转入计算受限（compute-bound）区间，它的收益会衰减，甚至由于额外的反量化开销而变为负收益。</b>
+W4A16 的收益并非无条件成立。利用Roofline 模型可以精确刻画它的适用边界，结论是：<b>W4A16 是为访存受限（memory-bound）场景设计的技术；随着 batch 增大、GEMM 逐渐转入计算受限（compute-bound）区间，它的收益会衰减，甚至由于额外的反量化开销而变为负收益。</b>
 </p>
 
 <h3>解码阶段：深陷访存受限区，收益接近 4 倍</h3>
@@ -256,15 +259,15 @@ AI(M) = 2MNK / [2MK + b_w &middot; KN + 2MN]
 </p>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-<b>优化目标应随 M 漂移。</b> 写 W4A16 kernel 时，小 M 区间应最大化访存效率（合并访问、L2 命中），大 M 区间则要把反量化开销从关键路径上藏起来（流水重叠、指令级并行）。8.6.3 的教学 kernel 以正确性和可读性优先，性能调优的方向会在末尾指出。
+<b>优化目标应随 M 漂移。</b> 写 W4A16 kernel 时，小 M 区间应最大化访存效率，大 M 区间则要把反量化开销从关键路径上藏起来。8.6.3 的教学 kernel 以正确性和可读性优先，性能调优的方向会在末尾指出。
 </p>
 
 <div class="callout warn">
-<b>核心结论</b>：W4A16 在 A100 上的收益拐点大约在 M &asymp; 39。低于此值时收益接近理论 4&times;，高于此值后收益急剧衰减。这一结论在 8.6.3 的 benchmark 实验中会得到验证。
+<b>核心结论</b>：W4A16 在 A100 上的收益拐点大约在 M &asymp; 39。低于此值时收益接近理论 4&times;，高于此值后收益急剧衰减。这一结论在 2.1.3 的 benchmark 实验中会得到验证。
 </div>
 
 <!-- ════════════════════════════════════════ -->
-<h2>8.6.3 代码实战：反量化矩阵乘 Triton kernel 与对拍测试</h2>
+<h2>2.1.3 代码实战：反量化矩阵乘 Triton kernel 与对拍测试</h2>
 <!-- ════════════════════════════════════════ -->
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
@@ -272,7 +275,7 @@ AI(M) = 2MNK / [2MK + b_w &middot; KN + 2MN]
 </p>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-约定与 8.6.1 一致：8 个 4-bit 值沿 K 维打包进一个 <code>int32</code>；按 <code>group_size = 128</code> 沿 K 维分组做非对称量化，量化值 <code>q &isin; [0, 15]</code>，反量化公式为 <code>w = (q - zero) * scale</code>。
+约定与 2.1.1 一致：8 个 4-bit 值沿 K 维打包进一个 <code>int32</code>；按 <code>group_size = 128</code> 沿 K 维分组做非对称量化，量化值 <code>q &isin; [0, 15]</code>，反量化公式为 <code>w = (q - zero) * scale</code>。
 </p>
 
 <h3>第一步：权重量化与位打包（离线，PyTorch 实现）</h3>

@@ -85,11 +85,11 @@ table.comparison td {
 <a class="back-link" href="index.html">&larr; Back to homepage</a>
 
 <div id="toptitle">
-<h1>1.2 Speculative Decoding（投机解码）</h1>
+<h1>1.6 Speculative Decoding（投机解码）</h1>
 </div>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-上一节讨论的连续批处理，解决的是"如何把多个请求高效地组织在一起"的问题。但即便调度做到极致，单个请求的解码延迟仍然受制于一个更底层的事实：自回归解码是严重<b>访存受限</b>（Memory-Bound）的，GPU 的绝大部分算力处于闲置状态。投机解码（Speculative Decoding）正是把这段闲置算力变现的技术——先用廉价方式猜出未来若干 token，再让大模型用一次并行前向把它们一次性验证掉。本节从加速比的定量分析出发，证明其分布无损性，并依次剖析 Medusa、EAGLE 与 MTP 三代主流实现。
+自回归解码是严重<b>访存受限</b>（Memory-Bound）的，GPU 的绝大部分算力处于闲置状态。投机解码（Speculative Decoding）正是把这段闲置算力变现的技术——先用廉价方式猜出未来若干 token，再让大模型用一次并行前向把它们一次性验证掉。本节从加速比的定量分析出发，证明其分布无损性，并依次剖析 Medusa、EAGLE 与 MTP 三代主流实现。
 </p>
 
 <h3>动机：自回归解码"慢得没道理"</h3>
@@ -117,7 +117,7 @@ table.comparison td {
 </div>
 
 <!-- ════════════════════════════════════════ -->
-<h2>1.2.1 draft-then-verify 与加速比分析</h2>
+<h2>1.6.1 draft-then-verify 与加速比分析</h2>
 <!-- ════════════════════════════════════════ -->
 
 <h3>基本框架</h3>
@@ -236,7 +236,7 @@ Speedup(γ, α, c) = ( 1 - α^(γ+1) ) / [ (1 - α) × (γc + 1) ]<br/>
 </div>
 
 <!-- ════════════════════════════════════════ -->
-<h2>1.2.2 为什么能保证输出分布不变</h2>
+<h2>1.6.2 为什么能保证输出分布不变</h2>
 <!-- ════════════════════════════════════════ -->
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
@@ -319,7 +319,7 @@ q(x)·min(1, p(x)/q(x)) = min(q(x), p(x))
 </p>
 
 <!-- ════════════════════════════════════════ -->
-<h2>1.2.3 Medusa 与树形注意力</h2>
+<h2>1.6.3 Medusa 与树形注意力</h2>
 <!-- ════════════════════════════════════════ -->
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
@@ -403,7 +403,7 @@ p_t^(k) = softmax( W_lm · ( h_t + SiLU(W₁^(k) · h_t) ) )
 <p>Medusa 的整体效果约为 <b>2.2–2.8×</b> 加速。</p>
 
 <!-- ════════════════════════════════════════ -->
-<h2>1.2.4 EAGLE 与 EAGLE-3</h2>
+<h2>1.6.4 EAGLE 与 EAGLE-3</h2>
 <!-- ════════════════════════════════════════ -->
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
@@ -512,7 +512,7 @@ g_t = [ h_t^(low) ; h_t^(mid) ; h_t^(high) ] ∈ R^{3d}&nbsp;&nbsp;→&nbsp;&nbs
 </table>
 
 <!-- ════════════════════════════════════════ -->
-<h2>1.2.5 MTP（Multi-Token Prediction）</h2>
+<h2>1.6.5 MTP（Multi-Token Prediction）</h2>
 <!-- ════════════════════════════════════════ -->
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
@@ -596,7 +596,7 @@ MTP 是这条线的自然终点：既然草稿模块的质量随训练数据 sca
 </p>
 
 <!-- ════════════════════════════════════════ -->
-<h2>1.2.6 小结与工程实践建议</h2>
+<h2>1.6.6 小结与工程实践建议</h2>
 <!-- ════════════════════════════════════════ -->
 
 <h3>方法选择</h3>
@@ -613,7 +613,7 @@ MTP 是这条线的自然终点：既然草稿模块的质量随训练数据 sca
 <h3>评测指标</h3>
 
 <p style="text-align:justify; text-justify:inter-ideograph;">
-不要只看端到端加速比（严重依赖硬件、batch、序列长度）。核心应报告<b>接受长度 τ</b>（与硬件无关，反映草稿质量）与 <b>c</b>（反映草稿开销），二者代入 1.2.1 的公式即可预估任意硬件上的收益。同时要区分<b>延迟</b>（TPOT）与<b>吞吐</b>（total TPS）两个维度——投机解码优化前者，可能损害后者。
+不要只看端到端加速比（严重依赖硬件、batch、序列长度）。核心应报告<b>接受长度 τ</b>（与硬件无关，反映草稿质量）与 <b>c</b>（反映草稿开销），二者代入 1.6.1 的公式即可预估任意硬件上的收益。同时要区分<b>延迟</b>（TPOT）与<b>吞吐</b>（total TPS）两个维度——投机解码优化前者，可能损害后者。
 </p>
 
 <h3>必做的正确性检查</h3>

@@ -1,0 +1,670 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+<link rel="shortcut icon" href="myIcon.ico">
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+<meta name="keywords" content="Speculative Decoding, Medusa, EAGLE, MTP, Tree Attention, LLM Inference, 投机解码">
+<meta name="description" content="Speculative Decoding for LLM Inference">
+<link rel="stylesheet" href="jemdoc.css" type="text/css">
+<title>Speculative Decoding — 投机解码</title>
+<style>
+/* ── Extra styles scoped to this article ── */
+pre.codeblock {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 16px 20px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 12px 0 18px;
+}
+.callout {
+    border-left: 3px solid #2563EB;
+    background: #EFF6FF;
+    padding: 10px 14px;
+    margin: 14px 0;
+    font-size: 14px;
+}
+.callout.warn {
+    border-left-color: #F59E0B;
+    background: #FFFBEB;
+}
+.callout.negative {
+    border-left-color: #EF4444;
+    background: #FEF2F2;
+}
+.callout.good {
+    border-left-color: #10B981;
+    background: #ECFDF5;
+}
+table.comparison {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 14px 0 18px;
+    font-size: 14px;
+}
+table.comparison th {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+}
+table.comparison td {
+    border: 1px solid #E2E8F0;
+    padding: 8px 12px;
+}
+.formula-box {
+    background: #1E293B;
+    color: #E2E8F0;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 14px 20px;
+    border-radius: 6px;
+    margin: 12px 0 18px;
+    line-height: 1.8;
+}
+.back-link {
+    font-size: 13px;
+    margin-bottom: 20px;
+    display: block;
+}
+.refs {
+    font-size: 13px;
+    line-height: 1.9;
+}
+</style>
+</head>
+<body>
+
+<div id="layout-content" style="margin-top:25px">
+
+<a class="back-link" href="index.html">&larr; Back to homepage</a>
+
+<div id="toptitle">
+<h1>1.2 Speculative Decoding（投机解码）</h1>
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+上一节讨论的连续批处理，解决的是"如何把多个请求高效地组织在一起"的问题。但即便调度做到极致，单个请求的解码延迟仍然受制于一个更底层的事实：自回归解码是严重<b>访存受限</b>（Memory-Bound）的，GPU 的绝大部分算力处于闲置状态。投机解码（Speculative Decoding）正是把这段闲置算力变现的技术——先用廉价方式猜出未来若干 token，再让大模型用一次并行前向把它们一次性验证掉。本节从加速比的定量分析出发，证明其分布无损性，并依次剖析 Medusa、EAGLE 与 MTP 三代主流实现。
+</p>
+
+<h3>动机：自回归解码"慢得没道理"</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+一次标准的解码步骤，要把整个模型的权重从 HBM 搬进片上 SRAM，然后只算出一个 token。以 70B 模型、BF16 权重为例：
+</p>
+
+<pre class="codeblock">
+单步 Decode 的成本拆解（70B 模型，BF16，H100，batch=1）
+
+  权重搬运量   ≈ 140 GB
+  计算量       ≈ 140 GFLOPs
+
+  访存耗时     = 140 GB / 3.35 TB/s   ≈ 42 ms      ← 瓶颈
+  计算耗时     = 140 GFLOPs / 990 TFLOPS ≈ 0.14 ms  ← 几乎空闲
+
+  算术强度 = 140e9 / 140e9 ≈ 2 FLOPs/Byte
+  H100 ridge point ≈ 300 FLOPs/Byte
+  → GPU 有 99% 以上的时间在等内存
+</pre>
+
+<div class="callout">
+这个失衡带来一个关键推论：在小 batch 场景下，<b>一次前向处理 1 个 token 和处理 8 个 token 的耗时几乎相同</b>——权重只搬一次，多算几个 token 基本是"免费"的。投机解码的全部收益都建立在这个前提上。
+</div>
+
+<!-- ════════════════════════════════════════ -->
+<h2>1.2.1 draft-then-verify 与加速比分析</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>基本框架</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+记目标模型（target model）为 <tt>M_p</tt>，其在前缀下的条件分布为 <tt>p</tt>；草稿模型（draft model）为 <tt>M_q</tt>，分布为 <tt>q</tt>。一轮投机解码由两个阶段构成。
+</p>
+
+<p><b>Draft 阶段</b>：用 <tt>M_q</tt> 自回归地生成 γ 个候选 token，同时保留每一步的完整分布（拒绝采样时要用）。</p>
+
+<div class="formula-box">
+x̃₁ ~ q(· | x&lt;t)<br/>
+x̃₂ ~ q(· | x&lt;t, x̃₁)<br/>
+&nbsp;⋮<br/>
+x̃_γ ~ q(· | x&lt;t, x̃₁..x̃_{γ-1})
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>Verify 阶段</b>：把 <tt>[x&lt;t, x̃₁, ..., x̃_γ]</tt> <b>一次性</b>送入 <tt>M_p</tt>。由于因果注意力的性质，这一次前向同时给出了 γ+1 个位置的分布：
+</p>
+
+<div class="formula-box">
+p₁ = p(· | x&lt;t)<br/>
+p₂ = p(· | x&lt;t, x̃₁)<br/>
+&nbsp;⋮<br/>
+p_{γ+1} = p(· | x&lt;t, x̃₁..x̃_γ)
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+注意最后一个分布 <tt>p_{γ+1}</tt>：它是"假设所有草稿都被接受"之后的下一个 token 分布。这意味着<b>即使 γ 个草稿全部被接受，仍能白送一个 token</b>，即所谓的 bonus token。因此单轮最多产出 γ+1 个 token。
+</p>
+
+<pre class="codeblock">
+一轮 draft-then-verify（γ = 4）
+
+  前缀: "The capital of France is"
+
+  Draft (小模型 4 步串行，每步很便宜)
+    → [" Paris", ",", " a", " city"]
+
+  Verify (大模型 1 次并行前向，5 个位置同时出分布)
+    位置1 ✓ Paris    位置2 ✓ ,    位置3 ✗ a  → 拒绝
+    位置3 重采样 → " which"
+    位置4、5 丢弃，KV cache 回滚
+
+  本轮产出 3 个 token，代价 = 4×T_draft + 1×T_target
+</pre>
+
+<h3>三个前提条件</h3>
+
+<ol>
+<li><p><b>Verify 近似免费</b>：一次处理 γ+1 个 token 的前向，耗时应接近处理 1 个 token。在 memory-bound 区间成立，随 batch size 增大逐渐失效。</p></li>
+<li><p><b>Draft 足够便宜</b>：记 <tt>c = T_draft / T_target</tt> 为单步成本比。独立小模型 c ≈ 0.02–0.1；Medusa / EAGLE 这类轻量头 c 可低至 0.01–0.05；n-gram / prompt lookup 则 c ≈ 0。</p></li>
+<li><p><b>Draft 足够准</b>：接受率 α 要高。α 与任务强相关——代码、摘要、格式化输出这类低熵任务 α 高；开放式创作、高温采样则 α 低。</p></li>
+</ol>
+
+<h3>期望接受长度</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+定义单步接受率 α = E[min(1, p(x̃)/q(x̃))]。在"各步接受事件独立同分布"这一常用简化假设下，接受的草稿数服从截断几何分布，加上必得的 1 个 token（重采样 token 或 bonus token），单轮产出期望为：
+</p>
+
+<div class="formula-box">
+τ = E[#tokens] = ( 1 - α^(γ+1) ) / ( 1 - α )
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+这个量常被称为<b>接受长度 τ</b>（acceptance length），是评价投机解码方法最核心的指标，因为它与具体硬件无关。直觉检查：α → 1 时 τ → γ+1（全接受）；α → 0 时 τ → 1（退化为普通解码）。另外 τ 关于 γ 是<b>次线性增长且有上界 1/(1-α)</b>，这是"γ 不能无限加大"的根本原因。
+</p>
+
+<h3>加速比公式</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+单轮墙钟时间为 γ·T_draft + T_target = T_target·(γc + 1)，而基线每个 token 耗时 T_target。于是：
+</p>
+
+<div class="formula-box">
+Speedup(γ, α, c) = ( 1 - α^(γ+1) ) / [ (1 - α) × (γc + 1) ]<br/>
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;分子 = 收益（接受长度）&nbsp;&nbsp;&nbsp;&nbsp;分母 = 代价（draft 开销）
+</div>
+
+<p>代入几组典型值（Leviathan et al., 2023 的经典结果）：</p>
+
+<table class="comparison">
+<tr><th>α</th><th>c</th><th>最优 γ*</th><th>最优加速比</th><th>说明</th></tr>
+<tr><td>0.6</td><td>0.05</td><td>4</td><td>1.92×</td><td>草稿质量一般，独立小模型典型值</td></tr>
+<tr><td>0.8</td><td>0.05</td><td>9–10</td><td>3.08×</td><td>优秀草稿（EAGLE 级别）</td></tr>
+<tr><td>0.9</td><td>0.05</td><td>13–15</td><td>4.67×</td><td>极强草稿 / 低熵任务</td></tr>
+<tr><td>0.8</td><td>0.20</td><td>4</td><td>1.87×</td><td>草稿模型过大，收益被吃掉一半</td></tr>
+<tr><td>0.8</td><td>0.01</td><td>20+</td><td>4.0×</td><td>近乎免费的草稿头</td></tr>
+</table>
+
+<p>可以读出三条工程结论：</p>
+<ul>
+<li><p><b>c 的影响巨大</b>：同样 α = 0.8，c 从 0.05 涨到 0.2，加速比从 3.08× 掉到 1.87×。选草稿模型时"小"往往比"准"更重要——这正是 Medusa / EAGLE 用一两层网络而非独立小模型的动机。</p></li>
+<li><p><b>γ 存在最优值</b>：τ 有上界而开销线性增长，γ 过大反而变慢。α 越高、c 越小，最优 γ 越大。</p></li>
+<li><p><b>投机解码不改变吞吐上限，只改善延迟</b>：它把闲置算力换成 token，总 FLOPs 是增加的（被拒绝的草稿是纯浪费）。</p></li>
+</ul>
+
+<h3>公式没说的部分：现实中的偏差</h3>
+
+<div class="callout negative">
+<b>Batch size 的杀伤力。</b> 随着 batch 增大，target 模型本身就离开了 memory-bound 区间，"并行验证近似免费"的前提崩塌：验证 γ+1 个 token 的成本开始正比于 γ+1。在高 batch 的吞吐导向场景（离线批处理），投机解码经常是<b>负收益</b>，因为浪费的 FLOPs 直接转化为吞吐损失。
+</div>
+
+<ul>
+<li><p><b>接受事件并非独立</b>：实测中越靠后的草稿 token 接受率越低（草稿模型误差累积）。真实 τ 低于几何分布的预测，最优 γ 也比公式给出的更小。</p></li>
+<li><p><b>T_draft 不只是 FLOPs</b>：草稿的 γ 步是串行的小 kernel，launch overhead、采样开销、调度开销都会被放大 γ 倍。CUDA Graph 捕获对投机解码几乎是必需的。</p></li>
+<li><p><b>KV cache 管理</b>：被拒绝的位置需要回滚 KV cache。在 PagedAttention 之类的分页系统里这是一次指针操作，代价可忽略；但草稿与目标模型要各维护一套 cache，显存占用增加。</p></li>
+<li><p><b>长上下文下的比例漂移</b>：上下文很长时，attention 部分成本随序列长度增长，其在 draft 与 target 之间的比例关系与 MLP 部分不同，c 会随上下文变化。</p></li>
+</ul>
+
+<div class="callout warn">
+生产系统通常设置 batch size 阈值，超过阈值就自动关闭投机解码或动态调低 γ（vLLM、TensorRT-LLM 都有类似机制）。
+</div>
+
+<!-- ════════════════════════════════════════ -->
+<h2>1.2.2 为什么能保证输出分布不变</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+投机解码最漂亮的地方在于：它不是近似加速，而是<b>在数学上精确等价于从目标模型采样</b>。这一点使它区别于量化、剪枝、蒸馏等所有有损加速手段——你不需要重新跑一遍质量评测。
+</p>
+
+<h3>修正拒绝采样（Modified Rejection Sampling）</h3>
+
+<p>在单个位置上，给定草稿分布 q、目标分布 p 和草稿采出的 token x̃ ~ q，判定规则是：</p>
+
+<div class="formula-box">
+1. 采 r ~ U[0, 1]<br/>
+2. 若 r ≤ min(1, p(x̃) / q(x̃))  →  <b>接受</b> x̃<br/>
+3. 否则 <b>拒绝</b>，从残差分布重采样：<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;x ~ p'(·),&nbsp;&nbsp; p'(x) = max(0, p(x) - q(x)) / Σ_x' max(0, p(x') - q(x'))
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+关键在第 3 步：拒绝时<b>不是</b>从 p 重采（那样会破坏分布），而是从"p 比 q 多出来的那部分质量"里采。直觉上，接受步骤已经按照 min(p, q) 的比例把 token 发出去了，剩下的缺口恰好是 max(0, p−q)。
+</p>
+
+<h3>正确性证明</h3>
+
+<p>记接受概率 β = Σ_x q(x)·min(1, p(x)/q(x)) = Σ_x min(p(x), q(x))。最终输出 token 为 x 的总概率由两条互斥路径组成：</p>
+
+<div class="formula-box">
+P(out = x) = q(x)·min(1, p(x)/q(x))  +  (1 - β)·p'(x)<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─ 采到 x 且被接受 ─┘&nbsp;&nbsp;&nbsp;└─ 被拒后重采到 x ─┘
+</div>
+
+<p>逐项化简。第一项：</p>
+
+<div class="formula-box">
+q(x)·min(1, p(x)/q(x)) = min(q(x), p(x))
+</div>
+
+<p>第二项，先算归一化常数。注意到：</p>
+
+<div class="formula-box">
+Σ_x max(0, p(x) - q(x)) = Σ_x [ p(x) - min(p(x), q(x)) ] = 1 - β<br/>
+<br/>
+∴ (1 - β)·p'(x) = (1 - β) × max(0, p(x)-q(x)) / (1 - β) = max(0, p(x) - q(x))
+</div>
+
+<p>归一化常数正好抵消。两项相加，分情况讨论：</p>
+
+<div class="formula-box">
+若 p(x) ≥ q(x):&nbsp;&nbsp; q(x) + (p(x) - q(x)) = p(x)&nbsp;&nbsp;✓<br/>
+若 p(x) &lt; q(x):&nbsp;&nbsp; p(x) + 0 = p(x)&nbsp;&nbsp;✓<br/>
+<br/>
+<b>∴ P(out = x) = p(x)&nbsp;&nbsp;对任意 x 成立</b>
+</div>
+
+<div class="callout good">
+<b>单个位置的输出严格服从目标分布，与 q 无关。</b> 由于每个位置的判定都基于真实前缀（被接受的草稿本身就构成合法采样路径），归纳可得整条序列的联合分布与朴素自回归采样完全一致。q 只影响 β（速度），不影响分布（质量）——这是整个方法的立身之本。
+</div>
+
+<h3>贪心解码的特例</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+当温度为 0 时，p 退化为 one-hot。此时 min(1, p(x̃)/q(x̃)) 非零当且仅当 x̃ = argmax p，规则退化为<b>逐位置精确匹配</b>：草稿 token 等于目标模型的 argmax 就接受，否则用 argmax 替换。这也是实现里最常见的路径，通常称为 greedy verification。
+</p>
+
+<h3>容易踩的坑</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>采样变换必须一致。</b> temperature、top-k、top-p、repetition penalty 都会改变分布。若目标端做了 top-p 截断，那么用于计算接受率的 p 必须是<b>截断并重归一化之后</b>的分布，q 同理。混用（比如 q 用原始 softmax、p 用 top-p 后的）会破坏等价性。工程上的标准做法是：先对两侧应用完全相同的 logits processor，再进入拒绝采样。
+</p>
+
+<div class="callout warn">
+<b>数值精度带来的实际偏差。</b> 严格等价成立于实数域。实际系统中，BF16/FP16 的 logits 有舍入误差；更麻烦的是，target 模型在 verify 阶段以序列长度 γ+1 做前向，而基线是长度 1 的前向，两者会走到<b>不同的 GEMM kernel、不同的规约顺序</b>，同一位置的 logits 会有 1e-3 量级差异。因此"投机解码输出与基线逐 token 完全一致"在贪心模式下也只是<b>高概率成立</b>，长序列上偶尔会因为两个近似相等的 logit 翻转而分叉。这是数值问题不是算法问题，但做回归测试时要有心理准备。
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>bonus token 的正确性。</b> 全接受时额外产出的 token 直接从 p_{γ+1} 采样，无需拒绝采样，因为它的前缀已经全部被验证过，p_{γ+1} 就是真实条件分布。
+</p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>推广到多候选。</b> 拒绝采样天然是"单条链"的。当需要在一个位置同时验证多个候选（树形草稿，见下节），需推广到 SpecInfer 提出的<b>多轮拒绝采样</b>：依次对候选做判定，每拒绝一个就把残差分布更新为 norm(max(0, p − q⁽ⁱ⁾))，再用下一个候选去试；全部拒绝则从最终残差分布采样。可以证明这仍保持分布不变，且接受概率随候选数单调上升。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>1.2.3 Medusa 与树形注意力</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+独立草稿模型有两个现实问题：需要一个词表对齐、架构兼容的小模型（很多模型系列根本没有足够小的成员）；以及它要维护自己的一整套 KV cache 和执行流。Medusa（Cai et al., 2024）提出了另一条路：<b>不要独立模型，直接在目标模型上长出几个额外的预测头</b>。
+</p>
+
+<h3>Medusa Heads</h3>
+
+<p>设目标模型最后一层的隐状态为 h_t。原始 LM head 用 h_t 预测 x_{t+1}；Medusa 额外添加 K 个头，第 k 个头用<b>同一个</b> h_t 预测 x_{t+1+k}：</p>
+
+<div class="formula-box">
+p_t^(k) = softmax( W_lm · ( h_t + SiLU(W₁^(k) · h_t) ) )
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+即一个带残差连接的单层 MLP，后接（共享的）LM head。参数量极小（每个头约 d² ），前向开销可忽略，c 接近 0.01。训练有两种模式：
+</p>
+
+<ul>
+<li><p><b>Medusa-1</b>：冻结骨干，只训练新头。显存友好，可在量化模型上训练，原模型质量完全不受影响，但 α 受限。</p></li>
+<li><p><b>Medusa-2</b>：骨干与头联合训练，需用较小学习率 + 对原 LM head 的损失加权，以免损害模型本身能力。α 显著更高。</p></li>
+</ul>
+
+<h3>从"链"到"树"</h3>
+
+<div class="callout negative">
+<b>Medusa 的根本弱点：头之间并行且相互独立。</b> head-1 预测 x_{t+2}，head-2 预测 x_{t+3}，两者都只看 h_t，head-2 并不知道 head-1 采了什么。草稿 token 之间没有依赖建模，α 因此不高——第 2、3 个头的 top-1 准确率通常只有 60% 和 40% 左右。
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+补救办法是<b>用宽度换深度</b>：既然单条链不准，就每个头取 top-k 个候选，组合成一棵候选树。只要其中任意一条路径被接受，这一轮就赚到了。朴素笛卡尔积会指数爆炸（k^K），所以 Medusa 用<b>稀疏树</b>：在校准集上统计每个头第 i 个候选的准确率，一条路径的期望接受率近似为路径上各节点准确率之积，按此贪心选取节点，构造一棵固定的（如 64 节点）树。典型形状是"头重脚轻"——浅层宽、深层窄。
+</p>
+
+<h3>树形注意力（Tree Attention）</h3>
+
+<p>问题来了：如何用<b>一次前向</b>验证整棵树？答案是把树展平成一个序列，然后定制 attention mask 与 position id：</p>
+
+<ul>
+<li><p><b>Attention mask</b>：节点只能 attend 到自己以及自己在树上的<b>祖先节点</b>（外加公共前缀），兄弟分支之间互不可见。这是一个由树结构决定的稀疏 mask，不再是标准下三角。</p></li>
+<li><p><b>Position id</b>：按节点在树中的<b>深度</b>赋值，而非展平序列中的下标。同一层的兄弟节点共享同一个 position id。这对 RoPE 正确性至关重要。</p></li>
+</ul>
+
+<pre class="codeblock">
+候选树:               展平序列:
+                      [ ...prefix, x_t, A, B, AA, AB, BA ]
+      x_t
+     /   \            Attention Mask (■ = 可见)
+    A     B                   pre  A  B  AA AB BA
+   / \     \            A      ■   ■  ·  ·  ·  ·
+  AA  AB    BA          B      ■   ·  ■  ·  ·  ·
+                        AA     ■   ■  ·  ■  ·  ·
+                        AB     ■   ■  ·  ·  ■  ·
+                        BA     ■   ·  ■  ·  ·  ■
+
+  Position ID:  A, B → t+1        AA, AB, BA → t+2
+                (兄弟节点共享 position，按树深度而非展平下标)
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+一次前向就得到了树上每个节点位置的目标分布，之后沿树从根往下找出<b>最长的被接受路径</b>，接受它，并把不在该路径上的 KV 条目从 cache 中剔除（实现上通常是把选中路径的 KV 搬到连续位置）。树形注意力是 Medusa 的核心工程贡献，此后被 EAGLE、SpecInfer、DeepSeek MTP 部署等几乎所有方案继承。
+</p>
+
+<h3>Typical Acceptance</h3>
+
+<p>Medusa 在验证时默认不用严格拒绝采样，而是用 typical acceptance：</p>
+
+<div class="formula-box">
+接受 x̃ &nbsp;⟺&nbsp; p(x̃ | x&lt;t) &gt; min( ε , δ · exp(−H(p(· | x&lt;t))) )<br/>
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;H 为目标分布的熵，典型取 ε = 0.3, δ = 0.09
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+含义是：只要目标模型认为这个 token "不算离谱"就放行；分布越不确定（熵越高），门槛越低。
+</p>
+
+<div class="callout warn">
+<b>这牺牲了分布严格不变</b>，换来明显更高的接受率。作者的论据是：温度采样本身就说明我们不追求唯一正确答案，典型集合内的 token 都可接受。实践中质量下降通常不显著，但这是一个需要显式知情的取舍——如果你的产品对"与原模型 bit-level 一致"有承诺（需复现历史输出、或有合规要求），就不能用这类方案。
+</div>
+
+<p>Medusa 的整体效果约为 <b>2.2–2.8×</b> 加速。</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>1.2.4 EAGLE 与 EAGLE-3</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+EAGLE（Extrapolation Algorithm for Greater Language-model Efficiency，Li et al., 2024）系列是目前开源方案中效果最好的一支，也是理解"草稿模型应该建模什么"的关键。
+</p>
+
+<h3>核心洞察：在特征层做自回归</h3>
+
+<ul>
+<li><p><b>观察一：特征序列比 token 序列更规整。</b> 直接预测 token 是在 |V| ≈ 1e5 的离散空间上做分类，误差大；而倒数第二层的隐状态（feature，记为 f）是连续的、低秩的、时间上平滑的序列，做自回归外推要容易得多。</p></li>
+<li><p><b>观察二：仅有特征不够，必须消歧。</b> 从 f_t 出发，下一步走向哪里取决于位置 t+1 实际采样出了哪个 token。例如前缀是 "I"，采到 "am" 和采到 "always" 会导向完全不同的后续特征。所以必须把<b>已经确定的下一个 token 的 embedding</b> 一起喂进去。</p></li>
+</ul>
+
+<p>两点合起来给出 EAGLE 的结构：</p>
+
+<div class="formula-box">
+f̂_{t+1} = DecoderLayer( FC( [ f_t ; e_{t+1} ] ) )<br/>
+<br/>
+&nbsp;&nbsp;FC:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;2d → d 的线性层<br/>
+&nbsp;&nbsp;DecoderLayer: <b>单层</b> Transformer decoder<br/>
+&nbsp;&nbsp;然后复用目标模型<b>冻结的</b> LM head 得到 token 分布
+</div>
+
+<pre class="codeblock">
+EAGLE 草稿循环
+
+  [f_t , e_{t+1}] → FC → Decoder → f̂_{t+1} → LM head → 采样 x̃_{t+2}
+                                       │                     │
+                                       └──────┬──────────────┘
+                                              ↓
+  [f̂_{t+1} , e_{t+2}] → FC → Decoder → f̂_{t+2} → LM head → 采样 x̃_{t+3}
+                                              ↓
+                                            ......
+
+  对比 Medusa: 第 k 步能看到前 k-1 步采出的 token → 草稿间存在依赖
+</pre>
+
+<div class="callout good">
+EAGLE 的草稿步骤是<b>真正自回归的</b>，恢复了 Medusa 丢失的因果链，α 大幅提升；而代价只是一层 decoder（7B 模型约 0.25B 参数），c 仍然很小。
+</div>
+
+<h3>训练</h3>
+
+<div class="formula-box">
+L = L_reg + w_cls · L_cls<br/>
+&nbsp;&nbsp;= SmoothL1( f_{t+1} , f̂_{t+1} )  +  w_cls · CE( p_{t+2} , p̂_{t+2} )<br/>
+<br/>
+&nbsp;&nbsp;典型 w_cls = 0.1，分类项用目标模型的软分布做蒸馏
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+一个重要细节是 <b>training-test 不一致</b>：训练时喂的 f_t 是目标模型的真实特征，而推理时第二步之后喂的是草稿模型自己预测的 f̂，带有误差。EAGLE 的处理是训练时对输入特征加入均匀噪声 U(−0.1, 0.1)。训练数据量很小（ShareGPT 约 68k 对话），单卡数天即可完成，且<b>目标模型完全冻结</b>——这是相对 Medusa-2 的一大优势，不存在损害原模型的风险。
+</p>
+
+<h3>EAGLE-2：动态草稿树</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+EAGLE-1 沿用 Medusa 式的<b>静态</b>树：形状在校准阶段确定，推理时对所有输入都一样。但接受率是上下文相关的——"the United States of" 后面接 "America" 几乎必然被接受，而一段开放式叙述的下一个词则高度不确定，用同一棵树对待两者显然低效。
+</p>
+
+<p>EAGLE-2 的贡献是发现：<b>草稿模型输出的置信度是接受率的良好近似</b>。于是可以在运行时动态构树：</p>
+
+<ul>
+<li><p><b>Expand 阶段</b>：逐层扩展，每层只从当前最有希望的若干节点继续展开。节点价值用<b>从根到该节点的置信度累积乘积</b>估计（近似整条路径被接受的概率）。</p></li>
+<li><p><b>Rerank 阶段</b>：扩展完成后，在全部候选节点中按累积置信度选出 top-m（例如 m=8 时性能已接近 m=60 的静态树），并保证被选中节点的祖先也一定入选（保持树结构合法），再送去验证。</p></li>
+</ul>
+
+<p>相同验证预算下拿到更高的接受长度，EAGLE-2 相比 EAGLE-1 再提升约 20–40%。</p>
+
+<h3>EAGLE-3：放弃特征回归，拥抱 scaling</h3>
+
+<div class="callout">
+EAGLE-3（2025）来自一个反直觉的发现：<b>特征回归损失 L_reg 是 scaling 的绊脚石。</b> 增加训练数据时，EAGLE-1/2 的接受长度很快饱和，因为模型容量被"精确复现目标模型的中间特征"这一约束占用了，而这个约束对最终目标（预测对 token）并非必要。
+</div>
+
+<p><b>改动一：去掉特征预测，改为 training-time test。</b></p>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+直接丢弃 L_reg，只保留 token 层面的目标。但这样一来，"喂给下一步的特征"就没有监督对齐了。解决办法是在训练时<b>显式模拟多步草稿过程</b>：把草稿模型自己产生的中间表示接回输入，走 2–3 步，每一步都算 token 级损失。这直接消除了 training-test 不一致，比加噪声的做法更彻底。
+</p>
+
+<p><b>改动二：融合多层特征。</b></p>
+
+<div class="formula-box">
+g_t = [ h_t^(low) ; h_t^(mid) ; h_t^(high) ] ∈ R^{3d}&nbsp;&nbsp;→&nbsp;&nbsp;降维层 (3d → d)<br/>
+<br/>
+&nbsp;&nbsp;不同深度携带互补信息：浅层偏词法/句法，深层偏语义
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+结果是接受长度显著提升，且<b>随训练数据量持续增长而不饱和</b>——具备了 scaling 性质。EAGLE-3 在 LLaMA、Qwen、DeepSeek 等模型上普遍达到 <b>4–6.5×</b> 加速（batch=1），接受长度 τ 可达 6–8。目前 SGLang、vLLM、TensorRT-LLM 均已内置支持，是开源部署的事实标准之一。
+</p>
+
+<h3>三代方法对比</h3>
+
+<table class="comparison">
+<tr><th>维度</th><th>独立小模型</th><th>Medusa</th><th>EAGLE-1/2</th><th>EAGLE-3</th></tr>
+<tr><td>草稿单元</td><td>完整小模型</td><td>K 个 MLP 头</td><td>1 层 decoder</td><td>1 层 decoder</td></tr>
+<tr><td>草稿间依赖</td><td>有（自回归）</td><td><b>无</b>（并行头）</td><td>有（特征级）</td><td>有</td></tr>
+<tr><td>输入</td><td>token</td><td>h_t</td><td>f_t + e_{t+1}</td><td>多层 h + e</td></tr>
+<tr><td>训练目标</td><td>独立预训练</td><td>CE</td><td>SmoothL1 + CE</td><td>CE（多步模拟）</td></tr>
+<tr><td>骨干是否改动</td><td>否</td><td>Medusa-2 会改</td><td>否</td><td>否</td></tr>
+<tr><td>分布不变</td><td>是</td><td>否（typical）</td><td>是</td><td>是</td></tr>
+<tr><td>草稿树</td><td>通常无</td><td>静态树</td><td>静态 / 动态树</td><td>动态树</td></tr>
+<tr><td>典型加速</td><td>1.5–2×</td><td>2.2–2.8×</td><td>2.5–4×</td><td>4–6.5×</td></tr>
+</table>
+
+<!-- ════════════════════════════════════════ -->
+<h2>1.2.5 MTP（Multi-Token Prediction）</h2>
+<!-- ════════════════════════════════════════ -->
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+前面的方法都是<b>事后</b>给一个已训练好的模型加装草稿模块。MTP 则把"预测多个未来 token"提前到<b>预训练阶段</b>，作为模型自身的一部分。
+</p>
+
+<h3>起点：MTP 首先是一种训练目标</h3>
+
+<p>Gloeckle et al. (2024) 提出：在共享 trunk 上接 n 个独立输出头，第 k 个头预测 x_{t+k}：</p>
+
+<div class="formula-box">
+L = Σ_{k=1..n} CE( x_{t+k} , p^(k)(· | x_≤t) )
+</div>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+他们发现这<b>不只是为了加速</b>，还能提升模型质量本身，尤其在代码等需要"规划"的任务上。直觉解释：next-token prediction 会让模型过度关注局部模式，很多 token 由前一个词就能猜出（teacher forcing 下的"捷径"）；强迫模型同时预测更远的 token，迫使它在隐状态中编码更长程的意图。同时每个位置提供 n 个训练信号，<b>监督被致密化</b>，数据效率更高。副产品是这些头天然可以拿来做自投机解码。注意该论文的头是<b>并行独立</b>的（与 Medusa 类似），预测之间没有因果链。
+</p>
+
+<h3>DeepSeek-V3 的顺序式 MTP</h3>
+
+<p>DeepSeek-V3 把 MTP 做成了<b>保持完整因果链</b>的形式，并作为正式的预训练目标之一。设深度为 D（V3 中 D=1），第 k 个 MTP 模块：</p>
+
+<div class="formula-box">
+h'_i^(k) = M_k · [ RMSNorm( h_i^(k-1) ) ; RMSNorm( Emb( t_{i+k} ) ) ]<br/>
+<br/>
+h^(k)_{1:T-k} = TRM_k( h'^(k)_{1:T-k} )<br/>
+<br/>
+P^(k)_{i+k+1} = OutHead( h_i^(k) )<br/>
+<br/>
+&nbsp;&nbsp;M_k : 2d → d 投影矩阵&nbsp;&nbsp;|&nbsp;&nbsp;TRM_k : 一层 Transformer block<br/>
+&nbsp;&nbsp;Embedding 层与 OutHead 与主模型<b>共享</b>
+</div>
+
+<div class="callout">
+<b>这个结构和 EAGLE 几乎一模一样</b>：都是把「当前隐状态」和「下一个 token 的 embedding」拼接后过一层 Transformer，再复用共享的 LM head。
+</div>
+
+<table class="comparison">
+<tr><th>维度</th><th>EAGLE</th><th>DeepSeek MTP</th></tr>
+<tr><td>训练时机</td><td>事后，目标模型冻结</td><td>与主模型<b>联合预训练</b></td></tr>
+<tr><td>数据量</td><td>约 68k 对话</td><td>全部预训练语料（万亿 token）</td></tr>
+<tr><td>对主模型的影响</td><td>无</td><td>提升主模型质量（额外训练信号）</td></tr>
+<tr><td>输入特征</td><td>倒数第二层</td><td>主模型最终隐状态</td></tr>
+</table>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+<b>训练目标</b>为各深度损失的平均乘以权重 λ 加到主损失上（V3 中前 10T token 用 0.3，后 4.8T 用 0.1）。<b>推理时有两种用法</b>：（a）直接丢弃 MTP 模块，主模型独立工作，此时 MTP 纯粹是一种训练时的正则/增强；（b）保留 MTP 模块做投机解码。DeepSeek 报告第二个 token 的接受率在 <b>85%–90%</b> 之间（跨任务稳定），配合投机解码可使 TPS 提升约 <b>1.8×</b>。
+</p>
+
+<h3>MTP 已成为标配</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+在 DeepSeek-V3 之后，MTP 迅速被主流开源模型采纳——Qwen3、GLM-4.5/4.6、MiniMax、Kimi 等都在预训练中加入了 MTP 模块并随权重一起发布。这带来一个重要变化：<b>投机解码的草稿模块不再需要下游使用者自己训练</b>，它作为模型权重的一部分直接发布，推理框架开箱即用。
+</p>
+
+<p>工程上的若干要点：</p>
+<ul>
+<li><p><b>多 MTP 层</b>：D &gt; 1 时可一次草稿多个 token，但深层模块接受率衰减；也可对单个 MTP 模块循环调用（自己的输出接回输入），此时会遇到与 EAGLE 相同的 training-test 不一致问题，接受率下降更快。</p></li>
+<li><p><b>与树形注意力结合</b>：MTP 草稿同样可配合树形候选与动态树构建（SGLang 的 EAGLE 风格调度可直接复用在 MTP 模块上）。</p></li>
+<li><p><b>MoE 模型的特殊性</b>：DeepSeek-V3 这类 MoE 模型算术强度更低（激活参数远小于总参数），memory-bound 更严重，投机解码收益更大；但验证多个 token 时可能激活更多专家，成本上升非线性。</p></li>
+<li><p><b>验证方式</b>：既可用严格拒绝采样保证分布不变，也可在贪心模式下做精确匹配。</p></li>
+</ul>
+
+<h3>MTP 与 EAGLE 的关系</h3>
+
+<pre class="codeblock">
+演化脉络
+
+  Medusa      并行独立头，无依赖建模          → 靠树宽补救
+     ↓
+  EAGLE       特征 + 下一 token embedding     → 恢复因果链，事后训练
+     ↓
+  EAGLE-3     多层特征 + 多步模拟训练          → 可 scaling
+     ↓
+  MTP         同样的结构，搬进预训练           → 草稿质量随基座一起 scale
+                                               且反过来提升基座质量
+</pre>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+MTP 是这条线的自然终点：既然草稿模块的质量随训练数据 scale，那就干脆让它跟着基座模型一起在万亿 token 上训练。
+</p>
+
+<!-- ════════════════════════════════════════ -->
+<h2>1.2.6 小结与工程实践建议</h2>
+<!-- ════════════════════════════════════════ -->
+
+<h3>方法选择</h3>
+
+<table class="comparison">
+<tr><th>场景</th><th>推荐方案</th></tr>
+<tr><td>模型自带 MTP 模块（DeepSeek-V3、Qwen3、GLM-4.5 等）</td><td>直接开启 MTP 投机解码</td></tr>
+<tr><td>有训练资源、追求最高加速</td><td>EAGLE-3</td></tr>
+<tr><td>无训练资源，输出与输入高度重叠（RAG、代码补全、文本编辑、格式化改写）</td><td>n-gram / prompt lookup decoding，零训练零成本</td></tr>
+<tr><td>已有同系列小模型且词表对齐</td><td>经典 draft model</td></tr>
+<tr><td>高 batch 吞吐场景</td><td>谨慎评估，很可能应当关闭</td></tr>
+</table>
+
+<h3>评测指标</h3>
+
+<p style="text-align:justify; text-justify:inter-ideograph;">
+不要只看端到端加速比（严重依赖硬件、batch、序列长度）。核心应报告<b>接受长度 τ</b>（与硬件无关，反映草稿质量）与 <b>c</b>（反映草稿开销），二者代入 1.2.1 的公式即可预估任意硬件上的收益。同时要区分<b>延迟</b>（TPOT）与<b>吞吐</b>（total TPS）两个维度——投机解码优化前者，可能损害后者。
+</p>
+
+<h3>必做的正确性检查</h3>
+
+<ul>
+<li><p>draft 与 target 侧应用了完全相同的 logits processor</p></li>
+<li><p>temperature、top-p 等参数在两侧一致</p></li>
+<li><p>bonus token 路径没有重复采样</p></li>
+<li><p>KV cache 回滚后位置编码正确</p></li>
+</ul>
+
+<div class="callout warn">
+一个常见 bug 是树形注意力的 position id 用了<b>展平序列的下标</b>而非<b>树深度</b>。症状很隐蔽：接受率无缘无故偏低，而输出仍然"看起来正常"（因为验证逻辑本身仍会纠正错误 token）。
+</div>
+
+<h3>自适应策略</h3>
+
+<p>生产系统通常需要根据运行时信号动态调整：</p>
+<ul>
+<li><p>batch size 超过阈值时降低 γ 或关闭投机解码</p></li>
+<li><p>根据近期接受率的滑动平均调整草稿树的大小</p></li>
+<li><p>对不同请求类型（低熵 vs 高熵任务）使用不同配置</p></li>
+</ul>
+
+<!-- ════════════════════════════════════════ -->
+<h2>参考文献</h2>
+<!-- ════════════════════════════════════════ -->
+
+<div class="refs">
+<ol>
+<li><p>Leviathan, Y., Kalman, M., Matias, Y. <i>Fast Inference from Transformers via Speculative Decoding.</i> ICML 2023.</p></li>
+<li><p>Chen, C., Borgeaud, S., et al. <i>Accelerating Large Language Model Decoding with Speculative Sampling.</i> 2023.</p></li>
+<li><p>Miao, X., et al. <i>SpecInfer: Accelerating Generative LLM Serving with Tree-based Speculative Inference and Verification.</i> ASPLOS 2024.</p></li>
+<li><p>Cai, T., Li, Y., et al. <i>Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.</i> ICML 2024.</p></li>
+<li><p>Li, Y., Wei, F., Zhang, C., Zhang, H. <i>EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty.</i> ICML 2024.</p></li>
+<li><p>Li, Y., et al. <i>EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees.</i> EMNLP 2024.</p></li>
+<li><p>Li, Y., et al. <i>EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test.</i> 2025.</p></li>
+<li><p>Gloeckle, F., Idrissi, B.Y., et al. <i>Better &amp; Faster Large Language Models via Multi-token Prediction.</i> ICML 2024.</p></li>
+<li><p>DeepSeek-AI. <i>DeepSeek-V3 Technical Report.</i> 2024.</p></li>
+</ol>
+</div>
+
+</div>
+
+<div id="footer">
+<div id="footer-text"></div>
+</div>
+
+<p><center>
+&copy; Xiaoyi | <a href="index.html">Homepage</a>
+</center></p>
+
+</body>
+</html>
